@@ -27,6 +27,8 @@ rosbag record -O optionA_v9_outputs.bag \
 /aruco/pose/marker_417 \
 /aruco/pose/marker_682 \
 /aruco/debug/marker_quality \
+/stereo/debug/timing \
+/aruco/debug/timing \
 /ekf/pose \
 /ekf/odom \
 /ekf/dead_reckoning \
@@ -37,6 +39,7 @@ rosbag record -O optionA_v9_outputs.bag \
 /ekf/debug/innovation \
 /ekf/debug/covariance \
 /ekf/debug/kalman_gain \
+/ekf/debug/timing \
 /ekf/sensor_status \
 /ekf/diagnostics \
 /controller/offline_frame_probe \

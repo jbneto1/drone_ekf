@@ -10,6 +10,47 @@ This package implements a simple EKF that:
 - **Publishes** filtered estimates to `/ekf/pose` and `/ekf/odom`
 - **Plots** raw vs filtered data in real-time for tuning
 
+### Fixed process-model period
+
+The PX4/MAVROS body-velocity stream in the recorded flight data averages
+29.998 Hz, so the EKF integrates every process sample with the configured
+`sensors.px4_velocity.sample_rate_hz: 30.0` (`dt = 1/30 s`). Message timestamp
+spacing is still published as `observed_dt` on `/ekf/debug/timing`, but network,
+queue, and callback jitter cannot change the integration period.
+
+### ArUco latency profiling
+
+Keep these JSON topics in flight bags:
+
+- `/stereo/debug/timing`: V4L2 read/decode, image split/message construction,
+  ROS publish calls, and camera pipeline time.
+- `/aruco/debug/timing`: image age at callback, `cv_bridge`, rectification,
+  left/right detection, matching, gates, raw PnP, stereo PnP, result/pose
+  publication, whole callback time, and camera sequence gaps.
+- `/ekf/debug/timing`: pose age at the EKF plus transform, validation,
+  measurement publication, x/y, z, yaw, estimate publication, and whole
+  callback time.
+
+Run `roslaunch drone_ekf plotter.launch` while collecting data and stop it
+normally to generate `aruco_latency_profile_final.png` in the configured plot
+directory. The plotter correlates records by the original frame stamp and
+marker ID. In particular:
+
+- `ROS left/right image transport/queue` is subscriber delivery minus that
+  image's publish completion; `Stereo sync dispatch` then isolates the
+  message-filter handoff into the paired callback.
+- `ROS images→synchronized callback` is the combined image publish-to-detector
+  boundary for comparison.
+- `ROS pose transport/queue` is EKF callback start minus marker-pose publish
+  completion.
+- Camera sequence gaps show frames discarded while the single-threaded
+  detector could not keep up.
+
+The camera header is stamped immediately after `VideoCapture::read()` because
+this camera path does not expose a hardware exposure timestamp.
+`capture_read_ms` therefore reports driver/acquisition blocking separately and
+is not part of the header-age calculation.
+
 ## 🔧 Installation
 
 ### 1. Build the package

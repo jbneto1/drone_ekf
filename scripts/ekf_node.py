@@ -73,9 +73,18 @@ class DroneEKF:
         # Initialize covariance matrix
         self.init_covariance()
         
-        # Timing
-        self.last_time = None
-        self.dt = 0.033
+        # Process-model timing is defined by the PX4/MAVROS source frequency,
+        # not callback arrival jitter. Keep observed source spacing separately
+        # so communication delays remain visible in diagnostics.
+        process_sensor_cfg = self.config['sensors']['px4_velocity']
+        self.process_sample_rate_hz = float(
+            process_sensor_cfg.get('sample_rate_hz', 30.0)
+        )
+        if not np.isfinite(self.process_sample_rate_hz) or self.process_sample_rate_hz <= 0.0:
+            raise ValueError("sensors.px4_velocity.sample_rate_hz must be positive")
+        self.dt = 1.0 / self.process_sample_rate_hz
+        self.last_process_stamp = None
+        self.observed_process_dt = None
         
         # Velocity storage
         self.last_body_velocity = np.zeros(3)
@@ -120,6 +129,10 @@ class DroneEKF:
         
         rospy.loginfo("[EKF] Node initialized (V4 - Modular)")
         rospy.loginfo(f"[EKF] Process model: {self.config['process_model']['type']}")
+        rospy.loginfo(
+            f"[EKF] Fixed process dt: {self.dt:.6f} s "
+            f"({self.process_sample_rate_hz:.3f} Hz PX4 velocity source)"
+        )
         rospy.loginfo(f"[EKF] ArUco: {self.config['sensors']['aruco']['enabled']}")
         rospy.loginfo(f"[EKF] Laser: {self.config['sensors']['laser']['enabled']}")
         rospy.loginfo(f"[EKF] UWB: {self.config['sensors']['uwb']['enabled']}")
@@ -309,34 +322,6 @@ class DroneEKF:
             'uwb': -1.0
         })
         self.mahal_cfg = self.config.get('mahalanobis', {})
-        self.innovation_limits_cfg = self.config.get('innovation_limits', {})
-
-        cov_limits = self.config.get('covariance_limits', {})
-        self.covariance_limits_enabled = bool(cov_limits.get('enabled', False))
-        self.covariance_min_diag = float(cov_limits.get('min_diag', 1e-9))
-        self.covariance_max_diag = self.build_covariance_limit_vector(
-            cov_limits.get('max_diag', {})
-        )
-
-    def build_covariance_limit_vector(self, max_diag_cfg):
-        """Build a 10-state covariance diagonal ceiling from config."""
-        defaults = {
-            'position': [np.inf, np.inf, np.inf],
-            'velocity': [np.inf, np.inf, np.inf],
-            'orientation': [np.inf, np.inf, np.inf, np.inf]
-        }
-        values = []
-        for key in ('position', 'velocity', 'orientation'):
-            configured = max_diag_cfg.get(key, defaults[key])
-            if len(configured) != len(defaults[key]):
-                rospy.logwarn(
-                    f"[EKF] covariance_limits.max_diag.{key} has "
-                    f"{len(configured)} values; expected {len(defaults[key])}. "
-                    "Using unbounded defaults for that block."
-                )
-                configured = defaults[key]
-            values.extend(configured)
-        return np.array(values, dtype=float)
     
     def init_covariance(self):
         """Initialize covariance matrix from config."""
@@ -516,7 +501,14 @@ class DroneEKF:
         status.values.append(KeyValue("vel_norm", f"{np.linalg.norm(self.state[3:6]):.3f}"))
         status.values.append(KeyValue("cov_pos", f"{np.trace(self.P[:3,:3]):.4f}"))
         status.values.append(KeyValue("cov_ori", f"{np.trace(self.P[6:10,6:10]):.4f}"))
-        status.values.append(KeyValue("dt", f"{self.dt:.4f}"))
+        status.values.append(KeyValue("fixed_process_dt", f"{self.dt:.6f}"))
+        status.values.append(KeyValue(
+            "observed_process_dt",
+            (
+                f"{self.observed_process_dt:.6f}"
+                if self.observed_process_dt is not None else "unavailable"
+            )
+        ))
         
         diag_array.status.append(status)
         self.diagnostics_pub.publish(diag_array)
@@ -552,7 +544,8 @@ class DroneEKF:
         self.publish_json_debug(self.covariance_pub, payload)
 
     def publish_timing_debug(self, header, stage, sensor=None, component=None,
-                             marker_id=None, accepted=None, dt=None):
+                             marker_id=None, accepted=None, dt=None,
+                             observed_dt=None):
         """Publish timestamp/age diagnostics for EKF data-flow analysis."""
         stamp = float(header.stamp.to_sec()) if not header.stamp.is_zero() else rospy.Time.now().to_sec()
         now = rospy.Time.now().to_sec()
@@ -569,13 +562,39 @@ class DroneEKF:
             payload['accepted'] = bool(accepted)
         if dt is not None:
             payload['dt'] = float(dt)
+        if observed_dt is not None:
+            payload['observed_dt'] = float(observed_dt)
+        self.publish_json_debug(self.timing_pub, payload)
+
+    def publish_aruco_callback_timing(self, header, marker_id,
+                                      callback_start_stamp,
+                                      callback_start_wall, status, timings):
+        """Publish a consolidated detector-pose-to-EKF callback profile."""
+        now = rospy.Time.now().to_sec()
+        stamp = (
+            float(header.stamp.to_sec())
+            if not header.stamp.is_zero() else callback_start_stamp
+        )
+        payload = {
+            'stamp': stamp,
+            'process_stamp': now,
+            'callback_start_stamp': float(callback_start_stamp),
+            'callback_complete_stamp': now,
+            'age_sec': now - stamp,
+            'source_to_callback_ms': (callback_start_stamp - stamp) * 1000.0,
+            'callback_total_ms': (time.perf_counter() - callback_start_wall) * 1000.0,
+            'stage': 'aruco_callback_profile',
+            'sensor': 'aruco',
+            'marker_id': int(marker_id),
+            'status': status,
+        }
+        payload.update({key: float(value) for key, value in timings.items()})
         self.publish_json_debug(self.timing_pub, payload)
 
     def publish_update_debug(self, header, sensor_name, component, innovation, S, R,
                              accepted, mahal_sq, gate, K=None, marker_id=None,
                              post_fit_residual=None, measurement_gain=None,
-                             rejection_reason=None, absolute_innovation=None,
-                             absolute_limit=None):
+                             rejection_reason=None):
         """Publish innovation, residual, and gain data for tuning plots."""
         innovation_payload = {
             'stamp': float(header.stamp.to_sec()),
@@ -593,15 +612,7 @@ class DroneEKF:
             'mahalanobis_sq': float(mahal_sq),
             'gate_threshold': float(gate),
             'age_sec': self.measurement_age_sec(header),
-            'rejection_reason': rejection_reason,
-            'absolute_innovation': (
-                float(absolute_innovation)
-                if absolute_innovation is not None else None
-            ),
-            'absolute_limit': (
-                float(absolute_limit)
-                if absolute_limit is not None else None
-            )
+            'rejection_reason': rejection_reason
         }
         self.publish_json_debug(self.innovation_pub, innovation_payload)
         self.publish_timing_debug(
@@ -632,9 +643,7 @@ class DroneEKF:
             post_fit_residual=post_fit_residual,
             K=K,
             measurement_gain=measurement_gain,
-            rejection_reason=rejection_reason,
-            absolute_innovation=absolute_innovation,
-            absolute_limit=absolute_limit
+            rejection_reason=rejection_reason
         )
 
     # =========================================================================
@@ -707,13 +716,6 @@ class DroneEKF:
                 parts.append(f"{sensor}:{component}<={threshold:.2f}")
         if not parts:
             parts.append('mahalanobis off')
-
-        abs_parts = []
-        for sensor, cfg in sorted(self.innovation_limits_cfg.items()):
-            if cfg.get('enabled', False):
-                abs_parts.append(sensor)
-        if abs_parts:
-            parts.append('absolute=' + ','.join(abs_parts))
         return ' | '.join(parts)
 
     def sensor_summary(self):
@@ -754,8 +756,7 @@ class DroneEKF:
     def record_update_dashboard(self, header, sensor_name, component, innovation,
                                 accepted, mahal_sq, gate, marker_id=None,
                                 post_fit_residual=None, K=None,
-                                measurement_gain=None, rejection_reason=None,
-                                absolute_innovation=None, absolute_limit=None):
+                                measurement_gain=None, rejection_reason=None):
         if not self.dashboard_enabled:
             return
         stamp = float(header.stamp.to_sec()) if not header.stamp.is_zero() else rospy.Time.now().to_sec()
@@ -774,14 +775,6 @@ class DroneEKF:
             'mahalanobis_sq': float(mahal_sq),
             'gate_threshold': float(gate),
             'rejection_reason': rejection_reason,
-            'absolute_innovation': (
-                float(absolute_innovation)
-                if absolute_innovation is not None else None
-            ),
-            'absolute_limit': (
-                float(absolute_limit)
-                if absolute_limit is not None else None
-            ),
             'gain_norm': float(np.linalg.norm(K)) if K is not None else None,
             'measurement_gain': (
                 float(measurement_gain)
@@ -818,15 +811,6 @@ class DroneEKF:
             gain = event.get('gain_norm')
         gain_text = self.fmt_num(gain, 3)
         reason = event.get('rejection_reason') or ''
-        if event.get('absolute_limit') is not None:
-            metric = event.get('absolute_innovation')
-            limit = event.get('absolute_limit')
-            if degrees:
-                metric = np.degrees(metric)
-                limit = np.degrees(limit)
-            reason = (reason + ' ' if reason else '') + (
-                f"abs={self.fmt_num(metric, 2)}/{self.fmt_num(limit, 2)}"
-            )
         reason = f" | {reason}" if reason else ''
         return (
             f"{status} {label:<12} {component:<8} "
@@ -1019,38 +1003,8 @@ class DroneEKF:
         return jac
 
     def stabilize_covariance(self):
-        """Keep P symmetric and bounded after linearized prediction/update steps."""
+        """Keep P symmetric after linearized prediction/update steps."""
         self.P = 0.5 * (self.P + self.P.T)
-
-        if not getattr(self, 'covariance_limits_enabled', False):
-            return
-
-        diag = np.diag(self.P).copy()
-        max_diag = self.covariance_max_diag
-
-        for idx, value in enumerate(diag):
-            ceiling = max_diag[idx]
-            if not np.isfinite(value):
-                self.P[idx, :] = 0.0
-                self.P[:, idx] = 0.0
-                self.P[idx, idx] = ceiling if np.isfinite(ceiling) else 1.0
-                continue
-
-            if np.isfinite(ceiling) and value > ceiling and value > 0.0:
-                scale = np.sqrt(ceiling / value)
-                self.P[idx, :] *= scale
-                self.P[:, idx] *= scale
-                self.P[idx, idx] = ceiling
-            elif value < self.covariance_min_diag:
-                self.P[idx, idx] = self.covariance_min_diag
-
-        diag = np.diag(self.P).copy()
-        for i in range(self.P.shape[0]):
-            for j in range(i + 1, self.P.shape[1]):
-                max_cov = np.sqrt(max(diag[i], 0.0) * max(diag[j], 0.0))
-                if np.isfinite(max_cov) and max_cov > 0.0:
-                    self.P[i, j] = np.clip(self.P[i, j], -max_cov, max_cov)
-                    self.P[j, i] = self.P[i, j]
 
     def normalize_state_quaternion(self):
         """Normalize the state quaternion and project P through that operation."""
@@ -1106,40 +1060,16 @@ class DroneEKF:
         )
         return enabled and mahal_sq > threshold, mahal_sq, threshold
 
-    def absolute_innovation_reject(self, innovation, sensor_name, component):
-        """Reject physically implausible measurement jumps even when P is huge."""
-        sensor_limits = self.innovation_limits_cfg.get(sensor_name, {})
-        if not sensor_limits or not bool(sensor_limits.get('enabled', False)):
-            return False, None, None
-
-        if component == 'xy':
-            limit = sensor_limits.get('xy_norm')
-            metric = float(np.linalg.norm(np.asarray(innovation).flatten()[:2]))
-        elif component == 'z':
-            limit = sensor_limits.get('z_abs')
-            metric = abs(float(np.asarray(innovation).flatten()[0]))
-        elif component == 'yaw':
-            limit = sensor_limits.get('yaw_abs')
-            metric = abs(float(np.asarray(innovation).flatten()[0]))
-        else:
-            limit = sensor_limits.get(f'{component}_abs')
-            metric = float(np.linalg.norm(np.asarray(innovation).flatten()))
-
-        if limit is None or float(limit) <= 0.0:
-            return False, metric, None
-        limit = float(limit)
-        return metric > limit, metric, limit
-
     # =========================================================================
     # PROCESS MODEL: PX4 VELOCITY
     # =========================================================================
     
     def px4_velocity_callback(self, msg):
         current_time = msg.header.stamp.to_sec()
-        
-        if self.last_time is not None:
-            self.dt = np.clip(current_time - self.last_time, 0.001, 0.5)
-        self.last_time = current_time
+
+        if self.last_process_stamp is not None:
+            self.observed_process_dt = current_time - self.last_process_stamp
+        self.last_process_stamp = current_time
         
         vz = msg.twist.linear.z
         
@@ -1225,7 +1155,10 @@ class DroneEKF:
                 f"dt: {self.dt:.3f} | pos: [{self.state[0]:.2f}, {self.state[1]:.2f}, {self.state[2]:.2f}]")
         
         self.record_prediction_dashboard(header, v_body, v_landpad, omega_body)
-        self.publish_timing_debug(header, 'prediction', sensor='px4_velocity', dt=self.dt)
+        self.publish_timing_debug(
+            header, 'prediction', sensor='px4_velocity',
+            dt=self.dt, observed_dt=self.observed_process_dt
+        )
         self.publish_estimates(header, source='prediction')
     # =========================================================================
     # MEASUREMENT UPDATE: ARUCO
@@ -1233,24 +1166,60 @@ class DroneEKF:
     
     def aruco_marker_callback(self, msg, marker_id):
         """Per-marker ArUco callback. Transforms and updates EKF with marker-specific noise."""
-        if self.is_stale(msg.header, 'aruco'):
+        callback_start_wall = time.perf_counter()
+        callback_start_stamp = rospy.Time.now().to_sec()
+        timings = {
+            'stale_check_ms': 0.0,
+            'transform_ms': 0.0,
+            'validation_ms': 0.0,
+            'measurement_publish_ms': 0.0,
+            'initialization_ms': 0.0,
+            'xy_update_ms': 0.0,
+            'z_update_ms': 0.0,
+            'yaw_update_ms': 0.0,
+            'estimate_publish_ms': 0.0,
+        }
+
+        stage_start = time.perf_counter()
+        stale = self.is_stale(msg.header, 'aruco')
+        timings['stale_check_ms'] = (time.perf_counter() - stage_start) * 1000.0
+        if stale:
             rospy.logwarn_throttle(2.0, f"[ARUCO] Dropping stale marker {marker_id} measurement")
+            self.publish_aruco_callback_timing(
+                msg.header, marker_id, callback_start_stamp,
+                callback_start_wall, 'rejected_stale', timings
+            )
             return
 
         # Transform ArUco measurement to drone pose in landpad frame
+        stage_start = time.perf_counter()
         pos_drone_landpad, quat_drone_landpad = self.transform_aruco_to_drone_frame(msg)
-        if not self.finite_pose(pos_drone_landpad, quat_drone_landpad):
+        timings['transform_ms'] = (time.perf_counter() - stage_start) * 1000.0
+
+        stage_start = time.perf_counter()
+        valid_pose = self.finite_pose(pos_drone_landpad, quat_drone_landpad)
+        timings['validation_ms'] = (time.perf_counter() - stage_start) * 1000.0
+        if not valid_pose:
             rospy.logwarn_throttle(2.0, f"[ARUCO] Dropping invalid marker {marker_id} measurement")
+            self.publish_aruco_callback_timing(
+                msg.header, marker_id, callback_start_stamp,
+                callback_start_wall, 'rejected_invalid', timings
+            )
             return
         
         # Update sensor status
         self.sensor_status.last_aruco_time = rospy.Time.now().to_sec()
         
         # Publish raw measurement for visualization
+        stage_start = time.perf_counter()
         self.publish_aruco_measurement(msg.header, pos_drone_landpad, quat_drone_landpad, marker_id)
+        timings['measurement_publish_ms'] = (
+            time.perf_counter() - stage_start
+        ) * 1000.0
         
         # State machine - initialize from first ArUco
         if self.mode == EKFState.WAITING:
+            stage_start = time.perf_counter()
             self.initialize_from_aruco(pos_drone_landpad, quat_drone_landpad)
             rospy.loginfo(f"[EKF] First ArUco detected (marker {marker_id})! Switching to TRACKING mode.")
             rospy.loginfo(f"[EKF] Initial position: [{pos_drone_landpad[0]:.3f}, "
@@ -1261,10 +1230,24 @@ class DroneEKF:
 
             # Force dashboard refresh immediately after initialization.
             self.maybe_render_debug_dashboard(force=True)
+            timings['initialization_ms'] = (
+                time.perf_counter() - stage_start
+            ) * 1000.0
+            self.publish_aruco_callback_timing(
+                msg.header, marker_id, callback_start_stamp,
+                callback_start_wall, 'initialized', timings
+            )
             return
         
         # Kalman update with marker-specific noise
-        self.update_aruco(pos_drone_landpad, quat_drone_landpad, msg.header, marker_id)
+        self.update_aruco(
+            pos_drone_landpad, quat_drone_landpad,
+            msg.header, marker_id, timings
+        )
+        self.publish_aruco_callback_timing(
+            msg.header, marker_id, callback_start_stamp,
+            callback_start_wall, 'updated', timings
+        )
         
         
     
@@ -1329,7 +1312,8 @@ class DroneEKF:
         yaw = np.degrees(tft.euler_from_quaternion(quaternion)[2])
         rospy.loginfo(f"[EKF] Initialized with yaw: {yaw:.1f}°")
     
-    def update_aruco(self, z_pos, z_quat, header, marker_id=None):
+    def update_aruco(self, z_pos, z_quat, header, marker_id=None,
+                     timing_profile=None):
         """EKF update using independently gated ArUco x/y, z, and yaw."""
         sensors = self.config['sensors']['aruco']
 
@@ -1343,23 +1327,43 @@ class DroneEKF:
 
         if sensors.get('position_update', True):
             if sensors.get('xy_update', True):
+                stage_start = time.perf_counter()
                 self.update_position_xy(z_pos, R_pos, header, 'aruco', 'xy',
                                         'aruco_xy', 9.210,
                                         f"ARUCO XY marker={marker_id}",
                                         marker_id=marker_id)
+                if timing_profile is not None:
+                    timing_profile['xy_update_ms'] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000.0
             if sensors.get('z_update', True):
+                stage_start = time.perf_counter()
                 self.update_position_z(z_pos, R_pos, header, 'aruco', 'z',
                                        'aruco_z', 6.635,
                                        f"ARUCO Z marker={marker_id}",
                                        marker_id=marker_id)
+                if timing_profile is not None:
+                    timing_profile['z_update_ms'] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000.0
 
         if sensors.get('orientation_update', True):
+            stage_start = time.perf_counter()
             self.update_yaw(z_quat, R_yaw, header, 'aruco', 'yaw',
                             'aruco_yaw', 6.635,
                             f"ARUCO YAW marker={marker_id}",
                             marker_id=marker_id)
+            if timing_profile is not None:
+                timing_profile['yaw_update_ms'] = (
+                    time.perf_counter() - stage_start
+                ) * 1000.0
 
+        stage_start = time.perf_counter()
         self.publish_estimates(header)
+        if timing_profile is not None:
+            timing_profile['estimate_publish_ms'] = (
+                time.perf_counter() - stage_start
+            ) * 1000.0
 
     def transform_thermal_to_drone_frame(self, msg):
         """Transform thermal detector output to drone pose in landpad frame."""
@@ -1414,28 +1418,17 @@ class DroneEKF:
         mahal_rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
-        abs_rejected, abs_metric, abs_limit = self.absolute_innovation_reject(
-            y, sensor_name, component
-        )
-        rejected = mahal_rejected or abs_rejected
-        rejection_reason = (
-            'mahalanobis' if mahal_rejected else
-            'absolute_innovation' if abs_rejected else None
-        )
-        if rejected:
+        rejection_reason = 'mahalanobis' if mahal_rejected else None
+        if mahal_rejected:
             self.publish_update_debug(
                 header, sensor_name, component, y, S, R_pos, False,
                 mahal_sq, gate, marker_id=marker_id,
-                rejection_reason=rejection_reason,
-                absolute_innovation=abs_metric,
-                absolute_limit=abs_limit
+                rejection_reason=rejection_reason
             )
             if self.debug_config['log_innovations']:
-                extra = (f" | abs={abs_metric:.3f} > {abs_limit:.3f}"
-                         if abs_rejected and abs_limit is not None else "")
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
-                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]{extra}")
+                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]")
             return True
 
         K = self.P @ H.T @ S_inv
@@ -1447,9 +1440,7 @@ class DroneEKF:
         self.publish_update_debug(
             header, sensor_name, component, y, S, R_pos, True,
             mahal_sq, gate, K=K, marker_id=marker_id,
-            post_fit_residual=post_fit_residual,
-            absolute_innovation=abs_metric,
-            absolute_limit=abs_limit
+            post_fit_residual=post_fit_residual
         )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1470,28 +1461,17 @@ class DroneEKF:
         mahal_rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
-        abs_rejected, abs_metric, abs_limit = self.absolute_innovation_reject(
-            y, sensor_name, component
-        )
-        rejected = mahal_rejected or abs_rejected
-        rejection_reason = (
-            'mahalanobis' if mahal_rejected else
-            'absolute_innovation' if abs_rejected else None
-        )
-        if rejected:
+        rejection_reason = 'mahalanobis' if mahal_rejected else None
+        if mahal_rejected:
             self.publish_update_debug(
                 header, sensor_name, component, y, S, R_xy, False,
                 mahal_sq, gate, marker_id=marker_id,
-                rejection_reason=rejection_reason,
-                absolute_innovation=abs_metric,
-                absolute_limit=abs_limit
+                rejection_reason=rejection_reason
             )
             if self.debug_config['log_innovations']:
-                extra = (f" | abs={abs_metric:.3f} > {abs_limit:.3f}"
-                         if abs_rejected and abs_limit is not None else "")
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
-                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}]{extra}")
+                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}]")
             return True
 
         K = self.P @ H.T @ S_inv
@@ -1503,9 +1483,7 @@ class DroneEKF:
         self.publish_update_debug(
             header, sensor_name, component, y, S, R_xy, True,
             mahal_sq, gate, K=K, marker_id=marker_id,
-            post_fit_residual=post_fit_residual,
-            absolute_innovation=abs_metric,
-            absolute_limit=abs_limit
+            post_fit_residual=post_fit_residual
         )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1526,28 +1504,17 @@ class DroneEKF:
         mahal_rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
-        abs_rejected, abs_metric, abs_limit = self.absolute_innovation_reject(
-            y, sensor_name, component
-        )
-        rejected = mahal_rejected or abs_rejected
-        rejection_reason = (
-            'mahalanobis' if mahal_rejected else
-            'absolute_innovation' if abs_rejected else None
-        )
-        if rejected:
+        rejection_reason = 'mahalanobis' if mahal_rejected else None
+        if mahal_rejected:
             self.publish_update_debug(
                 header, sensor_name, component, y, S, R_z, False,
                 mahal_sq, gate, marker_id=marker_id,
-                rejection_reason=rejection_reason,
-                absolute_innovation=abs_metric,
-                absolute_limit=abs_limit
+                rejection_reason=rejection_reason
             )
             if self.debug_config['log_innovations']:
-                extra = (f" | abs={abs_metric:.3f} > {abs_limit:.3f}"
-                         if abs_rejected and abs_limit is not None else "")
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
-                    f"innovation={y[0]:.3f}{extra}")
+                    f"innovation={y[0]:.3f}")
             return True
 
         K = self.P @ H.T @ S_inv
@@ -1559,9 +1526,7 @@ class DroneEKF:
         self.publish_update_debug(
             header, sensor_name, component, y, S, R_z, True,
             mahal_sq, gate, K=K, marker_id=marker_id,
-            post_fit_residual=post_fit_residual,
-            absolute_innovation=abs_metric,
-            absolute_limit=abs_limit
+            post_fit_residual=post_fit_residual
         )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1585,29 +1550,17 @@ class DroneEKF:
         mahal_rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
-        abs_rejected, abs_metric, abs_limit = self.absolute_innovation_reject(
-            y, sensor_name, component
-        )
-        rejected = mahal_rejected or abs_rejected
-        rejection_reason = (
-            'mahalanobis' if mahal_rejected else
-            'absolute_innovation' if abs_rejected else None
-        )
-        if rejected:
+        rejection_reason = 'mahalanobis' if mahal_rejected else None
+        if mahal_rejected:
             self.publish_update_debug(
                 header, sensor_name, component, y, S, R_yaw, False,
                 mahal_sq, gate, marker_id=marker_id,
-                rejection_reason=rejection_reason,
-                absolute_innovation=abs_metric,
-                absolute_limit=abs_limit
+                rejection_reason=rejection_reason
             )
             if self.debug_config['log_innovations']:
-                extra = (f" | abs={np.degrees(abs_metric):.2f} deg > "
-                         f"{np.degrees(abs_limit):.2f} deg"
-                         if abs_rejected and abs_limit is not None else "")
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
-                    f"yaw innovation={np.degrees(y[0]):.2f} deg{extra}")
+                    f"yaw innovation={np.degrees(y[0]):.2f} deg")
             return True
 
         K = self.P @ H.T @ S_inv
@@ -1626,9 +1579,7 @@ class DroneEKF:
             header, sensor_name, component, y, S, R_yaw, True,
             mahal_sq, gate, K=K, marker_id=marker_id,
             post_fit_residual=post_fit_residual,
-            measurement_gain=measurement_gain,
-            absolute_innovation=abs_metric,
-            absolute_limit=abs_limit
+            measurement_gain=measurement_gain
         )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1668,7 +1619,7 @@ class DroneEKF:
         # Publish measurement
         self.publish_laser_measurement(msg.header, z_drone_landpad)
         
-        # === EKF Update (z only) with Mahalanobis and absolute gates ===
+        # === EKF Update (z only) with Mahalanobis gate ===
         H = np.zeros((1, 10))
         H[0, 2] = 1.0  # Measures z
         
@@ -1682,28 +1633,17 @@ class DroneEKF:
         mahal_rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, 'laser', 'z', 'laser', 6.635
         )
-        abs_rejected, abs_metric, abs_limit = self.absolute_innovation_reject(
-            y, 'laser', 'z'
-        )
-        rejected = mahal_rejected or abs_rejected
-        rejection_reason = (
-            'mahalanobis' if mahal_rejected else
-            'absolute_innovation' if abs_rejected else None
-        )
-        if rejected:
+        rejection_reason = 'mahalanobis' if mahal_rejected else None
+        if mahal_rejected:
             self.publish_update_debug(
                 msg.header, 'laser', 'z', y, S, self.R_laser, False,
                 mahal_sq, gate,
-                rejection_reason=rejection_reason,
-                absolute_innovation=abs_metric,
-                absolute_limit=abs_limit
+                rejection_reason=rejection_reason
             )
             if self.debug_config['log_innovations']:
-                extra = (f" | abs={abs_metric:.3f} > {abs_limit:.3f}"
-                         if abs_rejected and abs_limit is not None else "")
                 rospy.logwarn(
                     f"[LASER] REJECTED Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
-                    f"innovation={y[0]:.3f}{extra}"
+                    f"innovation={y[0]:.3f}"
                 )
             return
         
@@ -1715,9 +1655,7 @@ class DroneEKF:
         post_fit_residual = z - H @ self.state
         self.publish_update_debug(
             msg.header, 'laser', 'z', y, S, self.R_laser, True,
-            mahal_sq, gate, K=K, post_fit_residual=post_fit_residual,
-            absolute_innovation=abs_metric,
-            absolute_limit=abs_limit
+            mahal_sq, gate, K=K, post_fit_residual=post_fit_residual
         )
         
         if self.debug_config['log_innovations']:

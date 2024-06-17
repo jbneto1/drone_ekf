@@ -102,6 +102,10 @@ sensors:
   px4_velocity:
     enabled: true
     topic: '/mavros/local_position/velocity_body'
+    # PX4/MAVROS source period. The recorded stream averages 29.998 Hz.
+    # EKF integration always uses 1/sample_rate_hz; callback jitter and delayed
+    # transport are observed for diagnostics but never change the process dt.
+    sample_rate_hz: 30.0
     use_z: false                  # z in the process model intentionally disabled
 
 process_model:
@@ -111,16 +115,6 @@ process_model:
     position: [10, 10, 10]           # variance [m^2 / s]
     velocity: [10, 10, 10]            # variance [(m/s)^2 / s]
     orientation: [10, 10, 10, 10]   # quaternion-component variance / s
-
-covariance_limits:
-  enabled: false
-  # Prevent long vision dropouts from making one later marker sample dominate
-  # the whole state. These are generous ceilings, not normal operating targets.
-  min_diag: 1.0e-9
-  max_diag:
-    position: [1.0, 1.0, 0.5]          # m^2
-    velocity: [1.0, 1.0, 0.5]          # (m/s)^2
-    orientation: [0.02, 0.02, 0.02, 0.02]
 
 output:
   # Use current ROS time for fused outputs so /ekf/odom and dead reckoning
@@ -162,16 +156,6 @@ mahalanobis:
     enabled: false
     position_threshold: 11.345
     yaw_threshold: 6.635
-
-innovation_limits:
-  aruco:
-    enabled: false
-    xy_norm: 1.0                  # m; reject impossible reacquisition jumps
-    z_abs: 0.50                   # m
-    yaw_abs: 0.60                 # rad, about 34 deg
-  laser:
-    enabled: false
-    z_abs: 0.60                   # m
 
 # Format: row-major 4x4 homogeneous matrix
 # [R11,R12,R13,tx, R21,R22,R23,ty, R31,R32,R33,tz, 0,0,0,1]
@@ -238,6 +222,8 @@ output_topics:
   kalman_gain_debug: '/ekf/debug/kalman_gain'
   timing_debug: '/ekf/debug/timing'
   aruco_marker_quality: '/aruco/debug/marker_quality'
+  stereo_camera_timing: '/stereo/debug/timing'
+  aruco_detector_timing: '/aruco/debug/timing'
 
 plotter:
   save_dir: '/tmp/ekf_plots'
