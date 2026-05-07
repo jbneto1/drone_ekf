@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- ====================================================================== -->
+    <!-- EKF Sensor Fusion Launch File                                          -->
+    <!-- ====================================================================== -->
+
+    <arg name="use_sim_time" default="false"/>
+    <param name="/use_sim_time" value="$(arg use_sim_time)"/>
+    
+    <!-- Arguments -->
+    <arg name="config_file" default="$(find iris_land)/config/ekf_params.yaml"/>
+    <arg name="enable_rviz" default="false"/>
+    <arg name="enable_frame_diagnostics" default="false"/>
+    <arg name="controller_pose_topic" default="/ekf/pose"/>
+    <arg name="diagnostics_csv_path" default=""/>
+    
+    <!-- EKF Node -->
+    <node name="drone_ekf" pkg="iris_land" type="ekf_node.py" output="screen">
+        <param name="config_file" value="$(arg config_file)"/>
+    </node> 
+
+    <!-- Passive diagnostics node for flight-test bags. It does not command the drone. -->
+    <node name="controller_frame_diagnostics" pkg="iris_land" type="controller_frame_diagnostics.py" output="screen"
+          if="$(arg enable_frame_diagnostics)">
+        <param name="controller_pose_topic" value="$(arg controller_pose_topic)"/>
+        <param name="yaw_target_rad" value="1.57079632679"/>
+        <param name="csv_path" value="$(arg diagnostics_csv_path)"/>
+    </node>
+    
+    <!-- RViz -->
+    <node name="rviz" pkg="rviz" type="rviz" 
+          args="-d $(find iris_land)/config/drone_pose.rviz" 
+          if="$(arg enable_rviz)"/>
+          
+</launch>
