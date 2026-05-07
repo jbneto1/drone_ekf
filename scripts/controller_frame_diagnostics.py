@@ -66,6 +66,34 @@ def twist_to_dict(msg):
     ])
 
 
+def empty_pose_dict(include_target_fields=False):
+    data = OrderedDict([
+        ('stamp', float('nan')),
+        ('frame_id', ''),
+        ('x', float('nan')),
+        ('y', float('nan')),
+        ('z', float('nan')),
+        ('yaw_rad', float('nan')),
+        ('yaw_deg', float('nan')),
+    ])
+    if include_target_fields:
+        data['yaw_error_to_target_rad'] = float('nan')
+        data['yaw_error_to_target_deg'] = float('nan')
+        data['drone_front_nearest_axis'] = 'unknown'
+    return data
+
+
+def empty_twist_dict():
+    return OrderedDict([
+        ('stamp', float('nan')),
+        ('frame_id', ''),
+        ('vx', float('nan')),
+        ('vy', float('nan')),
+        ('vz', float('nan')),
+        ('wz', float('nan')),
+    ])
+
+
 def nearest_axis(yaw):
     """Return nearest landpad axis direction for drone +X/front."""
     if not math.isfinite(yaw):
@@ -174,6 +202,9 @@ class ControllerFrameDiagnostics:
         data['topics'] = self.topics
         data['ages'] = OrderedDict((name, self.last[name].age(now)) for name in self.last)
 
+        # Always create the same diagnostic sections, even before the first
+        # message for a topic arrives. This keeps CSV columns stable when the
+        # first timer tick happens before /ekf/pose or command topics exist.
         if self.last['ekf_pose'].msg is not None:
             ekf = pose_to_dict(self.last['ekf_pose'].msg)
             yaw_err = wrap_pi(self.yaw_target - ekf['yaw_rad'])
@@ -181,17 +212,25 @@ class ControllerFrameDiagnostics:
             ekf['yaw_error_to_target_deg'] = math.degrees(yaw_err)
             ekf['drone_front_nearest_axis'] = nearest_axis(ekf['yaw_rad'])
             data['ekf_pose'] = ekf
+        else:
+            data['ekf_pose'] = empty_pose_dict(include_target_fields=True)
 
         if self.last['ekf_odom'].msg is not None:
             data['ekf_odom_pose'] = odom_to_pose_dict(self.last['ekf_odom'].msg)
+        else:
+            data['ekf_odom_pose'] = empty_pose_dict()
 
         for name in ['controller_pose', 'raw_aruco_pose', 'thermal_pose', 'local_pose']:
             if self.last[name].msg is not None:
                 data[name] = pose_to_dict(self.last[name].msg)
+            else:
+                data[name] = empty_pose_dict()
 
         for name in ['raw_controller_cmd', 'mavros_cmd']:
             if self.last[name].msg is not None:
                 data[name] = twist_to_dict(self.last[name].msg)
+            else:
+                data[name] = empty_twist_dict()
 
         # If MAVROS command is world/local velocity and local pose yaw is known,
         # reconstruct the approximate body-frame linear command that produced it.
@@ -204,6 +243,11 @@ class ControllerFrameDiagnostics:
             data['mavros_cmd_reconstructed_body_xy'] = OrderedDict([
                 ('vx_body_est', c * vx_w + s * vy_w),
                 ('vy_body_est', -s * vx_w + c * vy_w),
+            ])
+        else:
+            data['mavros_cmd_reconstructed_body_xy'] = OrderedDict([
+                ('vx_body_est', float('nan')),
+                ('vy_body_est', float('nan')),
             ])
 
         stale = [name for name, age in data['ages'].items()

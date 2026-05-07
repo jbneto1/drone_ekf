@@ -18,6 +18,7 @@ catkin_install_python(PROGRAMS
   scripts/ekf_node.py
   scripts/plotter.py
   scripts/controller_frame_diagnostics.py
+  scripts/offline_controller_frame_probe.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
