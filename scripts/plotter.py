@@ -85,18 +85,20 @@ class EKFPlotter:
         self.ekf_data = SensorData(max_pts)
         self.dr_data = SensorData(max_pts)  # Dead reckoning
         self.aruco_data = SensorData(max_pts)
+        self.thermal_data = SensorData(max_pts)
         self.laser_data = SensorData(max_pts)
         self.uwb_data = SensorData(max_pts)
-        
-        self.marker_363_data = SensorData(max_pts)
-        self.marker_682_data = SensorData(max_pts)
-        self.marker_417_data = SensorData(max_pts)
+
+        marker_cfg = self.config.get('sensors', {}).get('aruco', {}).get('markers', {})
+        marker_ids = sorted(int(mid) for mid in marker_cfg.keys()) if marker_cfg else [363, 682, 417]
+        self.aruco_marker_data = {mid: SensorData(max_pts) for mid in marker_ids}
         
         # Sensor status tracking
         self.sensor_config = {
             'aruco': {'enabled': False, 'active': False},
             'laser': {'enabled': False, 'active': False},
             'uwb': {'enabled': False, 'active': False},
+            'thermal': {'enabled': False, 'active': False},
             'process_model': 'unknown'
         }
         
@@ -148,6 +150,10 @@ class EKFPlotter:
             PoseStamped, self.aruco_callback, queue_size=1
         )
         rospy.Subscriber(
+            topics.get('thermal_measurement', '/ekf/measurements/thermal'),
+            PoseStamped, self.thermal_callback, queue_size=1
+        )
+        rospy.Subscriber(
             topics.get('laser_measurement', '/ekf/measurements/laser'),
             PointStamped, self.laser_callback, queue_size=1
         )
@@ -161,13 +167,14 @@ class EKFPlotter:
             topics.get('sensor_status', '/ekf/sensor_status'),
             String, self.status_callback, queue_size=1
         )
-        
-        rospy.Subscriber('/aruco/pose/marker_363', PoseStamped, 
-                 self.marker_363_callback, queue_size=1)
-        rospy.Subscriber('/aruco/pose/marker_682', PoseStamped,
-                        self.marker_682_callback, queue_size=1)
-        rospy.Subscriber('/aruco/pose/marker_417', PoseStamped,
-                        self.marker_417_callback, queue_size=1)
+
+        # EKF-transformed per-marker measurements, not raw camera-frame detections.
+        aruco_prefix = topics.get('aruco_marker_measurement_prefix',
+                                  topics.get('aruco_measurement', '/ekf/measurements/aruco') + '/marker_')
+        for marker_id in sorted(self.aruco_marker_data.keys()):
+            rospy.Subscriber(f'{aruco_prefix}{marker_id}', PoseStamped,
+                             lambda msg, mid=marker_id: self.aruco_marker_callback(msg, mid),
+                             queue_size=1)
     
     def get_time(self, stamp):
         """Get relative time from start."""
@@ -197,6 +204,12 @@ class EKFPlotter:
         t = self.get_time(msg.header.stamp)
         self.aruco_data.add_pose(t, msg.pose)
     
+    def thermal_callback(self, msg):
+        if self.shutdown_complete:
+            return
+        t = self.get_time(msg.header.stamp)
+        self.thermal_data.add_pose(t, msg.pose)
+
     def laser_callback(self, msg):
         if self.shutdown_complete:
             return
@@ -216,17 +229,13 @@ class EKFPlotter:
         except json.JSONDecodeError:
             pass
     
-    def marker_363_callback(self, msg):
+    def aruco_marker_callback(self, msg, marker_id):
+        if self.shutdown_complete:
+            return
         t = self.get_time(msg.header.stamp)
-        self.marker_363_data.add_pose(t, msg.pose)
-
-    def marker_682_callback(self, msg):
-        t = self.get_time(msg.header.stamp)
-        self.marker_682_data.add_pose(t, msg.pose)
-
-    def marker_417_callback(self, msg):
-        t = self.get_time(msg.header.stamp)
-        self.marker_417_data.add_pose(t, msg.pose)
+        if marker_id not in self.aruco_marker_data:
+            self.aruco_marker_data[marker_id] = SensorData(self.config.get('plotter', {}).get('max_points', 10000))
+        self.aruco_marker_data[marker_id].add_pose(t, msg.pose)
     # =========================================================================
     # PLOTTING
     # =========================================================================
@@ -255,20 +264,34 @@ class EKFPlotter:
         ekf = self.ekf_data.get_arrays()
         dr = self.dr_data.get_arrays()
         aruco = self.aruco_data.get_arrays()
+        thermal = self.thermal_data.get_arrays()
         laser = self.laser_data.get_arrays()
         uwb = self.uwb_data.get_arrays()
+        aruco_markers = {mid: data.get_arrays() for mid, data in self.aruco_marker_data.items()}
         
         # Unwrap yaw only if configured
         if should_unwrap:
             ekf['yaw'] = self.unwrap_yaw(ekf['yaw'])
             dr['yaw'] = self.unwrap_yaw(dr['yaw'])
             aruco['yaw'] = self.unwrap_yaw(aruco['yaw'])
+            thermal['yaw'] = self.unwrap_yaw(thermal['yaw'])
+            for marker in aruco_markers.values():
+                marker['yaw'] = self.unwrap_yaw(marker['yaw'])
         
         plot_count = 0
         
         # Per-sensor plots (only if sensor has data)
         if self.aruco_data.has_data and len(aruco['times']) > 5:
-            self.plot_sensor_comparison('ArUco', aruco, ekf, dr, prefix)
+            self.plot_sensor_comparison('ArUco Combined', aruco, ekf, dr, prefix)
+            plot_count += 1
+
+        for marker_id, marker_data in sorted(aruco_markers.items()):
+            if self.aruco_marker_data[marker_id].has_data and len(marker_data['times']) > 5:
+                self.plot_sensor_comparison(f'ArUco Marker {marker_id}', marker_data, ekf, dr, prefix)
+                plot_count += 1
+
+        if self.thermal_data.has_data and len(thermal['times']) > 5:
+            self.plot_sensor_comparison('Thermal', thermal, ekf, dr, prefix)
             plot_count += 1
         
         if self.laser_data.has_data and len(laser['times']) > 5:
@@ -281,7 +304,7 @@ class EKFPlotter:
         
         # Combined comparison plot
         if self.ekf_data.has_data and len(ekf['times']) > 10:
-            self.plot_combined_comparison(ekf, dr, aruco, laser, uwb, prefix)
+            self.plot_combined_comparison(ekf, dr, aruco, laser, uwb, thermal, aruco_markers, prefix)
             plot_count += 1
         
         if plot_count == 0:
@@ -366,7 +389,7 @@ class EKFPlotter:
         plt.close(fig)
         rospy.loginfo(f"[PLOTTER] Saved: {filepath}")
     
-    def plot_combined_comparison(self, ekf, dr, aruco, laser, uwb, prefix):
+    def plot_combined_comparison(self, ekf, dr, aruco, laser, uwb, thermal, aruco_markers, prefix):
         """
         Combined comparison plot showing all sensors, EKF, and dead reckoning.
         """
@@ -386,10 +409,12 @@ class EKFPlotter:
             'ekf':   {'color': 'blue',   'linewidth': 2.5, 'label': 'EKF (Fused)',                    'zorder': 5},
             'dr':    {'color': 'green',  'linewidth': 2,   'linestyle': '--', 'alpha': 0.7,
                     'label': 'Dead Reckoning (No Corrections)',                                       'zorder': 4},
-            'aruco': {'color': 'red',    'marker': 'o', 's': 40, 'alpha': 0.6, 'label': 'ArUco',      'zorder': 3},
+            'aruco': {'color': 'red',    'marker': 'o', 's': 40, 'alpha': 0.45, 'label': 'ArUco combined', 'zorder': 3},
+            'thermal': {'color': 'brown', 'marker': 'D', 's': 38, 'alpha': 0.75, 'label': 'Thermal', 'zorder': 3},
             'laser': {'color': 'orange', 'marker': 's', 's': 35, 'alpha': 0.7, 'label': 'Laser',      'zorder': 3},
             'uwb':   {'color': 'purple', 'marker': '^', 's': 35, 'alpha': 0.7, 'label': 'UWB',        'zorder': 3}
         }
+        marker_colors = ['crimson', 'darkcyan', 'darkgoldenrod', 'magenta', 'black', 'tab:pink']
         
         all_handles = []
         all_labels  = []
@@ -440,6 +465,39 @@ class EKFPlotter:
                         all_handles.append(scatter)
                         all_labels.append(styles['aruco']['label'])
             
+            # Plot per-marker ArUco measurements with distinct colors
+            for idx, (marker_id, marker_data) in enumerate(sorted(aruco_markers.items())):
+                if marker_id not in self.aruco_marker_data or not self.aruco_marker_data[marker_id].has_data:
+                    continue
+                if len(marker_data['times']) == 0:
+                    continue
+                valid = ~np.isnan(marker_data[key])
+                if np.any(valid):
+                    color = marker_colors[idx % len(marker_colors)]
+                    label_text = f'ArUco ID {marker_id}'
+                    scatter = ax.scatter(marker_data['times'][valid], marker_data[key][valid],
+                            c=color, s=34, marker='o', alpha=0.75,
+                            label=label_text, edgecolors=color, linewidths=0.5, zorder=4)
+                    if label_text not in all_labels:
+                        all_handles.append(scatter)
+                        all_labels.append(label_text)
+
+            # Plot Thermal
+            if self.thermal_data.has_data and len(thermal['times']) > 0:
+                valid = ~np.isnan(thermal[key])
+                if np.any(valid):
+                    scatter = ax.scatter(thermal['times'][valid], thermal[key][valid],
+                            c=styles['thermal']['color'],
+                            s=styles['thermal']['s'],
+                            marker=styles['thermal']['marker'],
+                            alpha=styles['thermal']['alpha'],
+                            label=styles['thermal']['label'],
+                            edgecolors='saddlebrown', linewidths=0.5,
+                            zorder=styles['thermal']['zorder'])
+                    if styles['thermal']['label'] not in all_labels:
+                        all_handles.append(scatter)
+                        all_labels.append(styles['thermal']['label'])
+
             # Plot Laser
             if self.laser_data.has_data and len(laser['times']) > 0:
                 valid = ~np.isnan(laser[key])

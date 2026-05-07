@@ -6,7 +6,10 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   geometry_msgs
   nav_msgs
-  tf
+  sensor_msgs
+  mavros_msgs
+  diagnostic_msgs
+  tf2_ros
 )
 
 catkin_package()
@@ -14,9 +17,10 @@ catkin_package()
 catkin_install_python(PROGRAMS
   scripts/ekf_node.py
   scripts/plotter.py
+  scripts/controller_frame_diagnostics.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(DIRECTORY launch/
-  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+install(DIRECTORY launch config
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

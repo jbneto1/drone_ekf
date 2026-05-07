@@ -36,10 +36,12 @@ class SensorStatus:
         self.aruco_active = False
         self.laser_active = False
         self.uwb_active = False
+        self.thermal_active = False
         self.optical_flow_active = False
         self.last_aruco_time = 0.0
         self.last_laser_time = 0.0
         self.last_uwb_time = 0.0
+        self.last_thermal_time = 0.0
         self.last_flow_time = 0.0
         self.timeout = 2.0  # seconds
 
@@ -223,9 +225,11 @@ class DroneEKF:
         self.transforms = {}
         
         transform_keys = [
-            'T_cam_to_drone', 'T_laser_to_drone', 
+            'T_cam_to_drone', 'T_laser_to_drone',
             'T_uwb_to_drone', 'T_flow_to_drone'
         ]
+        if 'T_thermal_to_drone' in self.config.get('transforms', {}):
+            transform_keys.append('T_thermal_to_drone')
         
         for key in transform_keys:
             matrix_flat = self.config['transforms'][key]['matrix']
@@ -267,10 +271,23 @@ class DroneEKF:
         self.R_laser = np.diag(self.config['measurement_noise']['laser']['z'])
         self.R_uwb = np.diag(self.config['measurement_noise']['uwb']['xy'])
         self.R_flow = np.diag(self.config['measurement_noise']['optical_flow']['velocity_xy'])
+
+        # Yaw-only vision updates. Keep backward compatibility with older
+        # orientation_rvec configs by using the yaw/z component if no explicit
+        # yaw noise is configured.
+        self.R_aruco_yaw = np.array([[
+            self.config['measurement_noise']['aruco'].get(
+                'yaw', self.config['measurement_noise']['aruco']['orientation_rvec'][2])
+        ]])
+        thermal_noise = self.config.get('measurement_noise', {}).get('thermal', {})
+        self.R_thermal_pos = np.diag(thermal_noise.get('position',
+            self.config['measurement_noise']['aruco']['position']))
+        self.R_thermal_yaw = np.array([[thermal_noise.get('yaw', self.R_aruco_yaw[0, 0])]])
         
         # Per-marker R matrices (fall back to default if not specified)
         self.R_aruco_per_marker_pos = {}
         self.R_aruco_per_marker_ori = {}
+        self.R_aruco_per_marker_yaw = {}
         markers_cfg = self.config['sensors']['aruco'].get('markers', {})
         for marker_id_str, marker_cfg in markers_cfg.items():
             mid = int(marker_id_str)
@@ -278,19 +295,24 @@ class DroneEKF:
                 marker_cfg.get('position_noise',
                                self.config['measurement_noise']['aruco']['position'])
             )
-            self.R_aruco_per_marker_ori[mid] = np.diag(
-                marker_cfg.get('orientation_noise_rvec',
-                               self.config['measurement_noise']['aruco']['orientation_rvec'])
-            )
+            marker_ori_noise = marker_cfg.get('orientation_noise_rvec',
+                self.config['measurement_noise']['aruco']['orientation_rvec'])
+            self.R_aruco_per_marker_ori[mid] = np.diag(marker_ori_noise)
+            self.R_aruco_per_marker_yaw[mid] = np.array([[
+                marker_cfg.get('orientation_noise_yaw', marker_ori_noise[2])
+            ]])
             rospy.loginfo(f"[EKF] Marker {mid} R_pos diag: {np.diag(self.R_aruco_per_marker_pos[mid])}")
         
-        # Mahalanobis gate thresholds
+        # Mahalanobis gates. New-style config uses explicit enable flags;
+        # old-style negative thresholds still disable gates for compatibility.
         self.mahal_gates = self.config.get('mahalanobis_gates', {
-            'aruco_position': 11.345,
-            'aruco_orientation': 11.345,
-            'laser': 6.635,
-            'uwb': 9.210
+            'aruco_position': -1.0,
+            'aruco_yaw': -1.0,
+            'thermal_position': -1.0,
+            'thermal_yaw': -1.0,
+            'uwb': -1.0
         })
+        self.mahal_cfg = self.config.get('mahalanobis', {})
     
     def init_covariance(self):
         """Initialize covariance matrix from config."""
@@ -339,6 +361,14 @@ class DroneEKF:
                     queue_size=1
                 )
                 rospy.loginfo(f"[EKF] Subscribed to ArUco marker {marker_id}: {topic}")
+
+        thermal_cfg = sensors.get('thermal', {})
+        if thermal_cfg.get('enabled', False):
+            rospy.Subscriber(
+                thermal_cfg.get('topic', '/thermal/pose'),
+                PoseStamped, self.thermal_callback, queue_size=1
+            )
+            rospy.loginfo(f"[EKF] Subscribed to Thermal: {thermal_cfg.get('topic', '/thermal/pose')}")
         
         if sensors['laser']['enabled']:
             rospy.Subscriber(
@@ -364,6 +394,17 @@ class DroneEKF:
         
         # Per-sensor measurement publishers (transformed to landpad frame)
         self.aruco_meas_pub = rospy.Publisher(topics['aruco_measurement'], PoseStamped, queue_size=1)
+        self.aruco_marker_meas_pubs = {}
+        aruco_prefix = topics.get('aruco_marker_measurement_prefix', topics['aruco_measurement'] + '/marker_')
+        for marker_id_str in self.config.get('sensors', {}).get('aruco', {}).get('markers', {}):
+            mid = int(marker_id_str)
+            self.aruco_marker_meas_pubs[mid] = rospy.Publisher(
+                f"{aruco_prefix}{mid}", PoseStamped, queue_size=1
+            )
+        self.thermal_meas_pub = rospy.Publisher(
+            topics.get('thermal_measurement', '/ekf/measurements/thermal'),
+            PoseStamped, queue_size=1
+        )
         self.laser_meas_pub = rospy.Publisher(topics['laser_measurement'], PointStamped, queue_size=1)
         self.uwb_meas_pub = rospy.Publisher(topics['uwb_measurement'], PointStamped, queue_size=1)
         
@@ -405,6 +446,10 @@ class DroneEKF:
             'uwb': {
                 'enabled': self.config['sensors']['uwb']['enabled'],
                 'active': (current_time - self.sensor_status.last_uwb_time) < timeout
+            },
+            'thermal': {
+                'enabled': self.config['sensors'].get('thermal', {}).get('enabled', False),
+                'active': (current_time - self.sensor_status.last_thermal_time) < timeout
             },
             'process_model': self.config['process_model']['type']
         }
@@ -503,6 +548,46 @@ class DroneEKF:
         if norm > 1e-6:
             return q / norm
         return np.array([0.0, 0.0, 0.0, 1.0])
+
+    def wrap_angle(self, angle):
+        """Wrap angle to [-pi, pi]."""
+        return np.arctan2(np.sin(angle), np.cos(angle))
+
+    def yaw_from_quaternion(self, q):
+        """Extract yaw from quaternion [x, y, z, w]."""
+        return tft.euler_from_quaternion(q)[2]
+
+    def finite_pose(self, position, quaternion):
+        """Reject NaN/Inf measurements before they enter the EKF."""
+        return np.all(np.isfinite(position)) and np.all(np.isfinite(quaternion))
+
+    def is_stale(self, header, sensor_name):
+        """Return True when a timestamped measurement is too old. Disabled by default."""
+        sensor_cfg = self.config.get('sensors', {}).get(sensor_name, {})
+        max_age = sensor_cfg.get('max_age', 0.0)
+        if max_age <= 0.0 or header.stamp.is_zero():
+            return False
+        return (rospy.Time.now() - header.stamp).to_sec() > max_age
+
+    def gate_enabled_and_threshold(self, sensor_name, component, legacy_key, default_threshold):
+        """Read Mahalanobis gate settings with explicit flags and old-key fallback."""
+        sensor_gate = self.mahal_cfg.get(sensor_name, {})
+        if sensor_gate:
+            enabled = bool(sensor_gate.get('enabled', False))
+            threshold = sensor_gate.get(f'{component}_threshold',
+                                        sensor_gate.get('threshold', default_threshold))
+            return enabled, float(threshold)
+
+        threshold = float(self.mahal_gates.get(legacy_key, -1.0))
+        return threshold > 0.0, threshold
+
+    def mahalanobis_reject(self, innovation, S_inv, sensor_name, component, legacy_key, default_threshold):
+        """Return (reject, distance², threshold) for optional Mahalanobis gates."""
+        mahal_sq = float(innovation.T @ S_inv @ innovation)
+        enabled, threshold = self.gate_enabled_and_threshold(
+            sensor_name, component, legacy_key, default_threshold
+        )
+        return enabled and mahal_sq > threshold, mahal_sq, threshold
 
     # =========================================================================
     # PROCESS MODEL: PX4 VELOCITY
@@ -682,14 +767,17 @@ class DroneEKF:
         delta_angle = omega_body * self.dt
         delta_quat = self.rotation_vector_to_quaternion(delta_angle)
         
-        self.state[6:10] = self.quaternion_multiply(delta_quat, self.state[6:10])
+        # State quaternion maps drone/body coordinates into the landpad frame.
+        # PX4 velocity_body angular rates are body-frame rates, so the
+        # incremental rotation must be applied on the right: q <- q ⊗ δq_body.
+        self.state[6:10] = self.quaternion_multiply(self.state[6:10], delta_quat)
         self.state[6:10] = self.normalize_quaternion(self.state[6:10])
         
         # === Dead Reckoning Update (same logic) ===
         R_dr = self.quaternion_to_rotation_matrix(self.dead_reckoning_quat)
         v_landpad_dr = R_dr @ v_body
         self.dead_reckoning_pos += v_landpad_dr * self.dt
-        self.dead_reckoning_quat = self.quaternion_multiply(delta_quat, self.dead_reckoning_quat)
+        self.dead_reckoning_quat = self.quaternion_multiply(self.dead_reckoning_quat, delta_quat)
         self.dead_reckoning_quat = self.normalize_quaternion(self.dead_reckoning_quat)
         
         # === Covariance Prediction ===
@@ -713,14 +801,21 @@ class DroneEKF:
     
     def aruco_marker_callback(self, msg, marker_id):
         """Per-marker ArUco callback. Transforms and updates EKF with marker-specific noise."""
+        if self.is_stale(msg.header, 'aruco'):
+            rospy.logwarn_throttle(2.0, f"[ARUCO] Dropping stale marker {marker_id} measurement")
+            return
+
         # Transform ArUco measurement to drone pose in landpad frame
         pos_drone_landpad, quat_drone_landpad = self.transform_aruco_to_drone_frame(msg)
+        if not self.finite_pose(pos_drone_landpad, quat_drone_landpad):
+            rospy.logwarn_throttle(2.0, f"[ARUCO] Dropping invalid marker {marker_id} measurement")
+            return
         
         # Update sensor status
         self.sensor_status.last_aruco_time = rospy.Time.now().to_sec()
         
         # Publish raw measurement for visualization
-        self.publish_aruco_measurement(msg.header, pos_drone_landpad, quat_drone_landpad)
+        self.publish_aruco_measurement(msg.header, pos_drone_landpad, quat_drone_landpad, marker_id)
         
         # State machine - initialize from first ArUco
         if self.mode == EKFState.WAITING:
@@ -799,98 +894,134 @@ class DroneEKF:
         rospy.loginfo(f"[EKF] Initialized with yaw: {yaw:.1f}°")
     
     def update_aruco(self, z_pos, z_quat, header, marker_id=None):
-        """EKF Update Step using ArUco measurement with Mahalanobis gating."""
+        """EKF update using ArUco x/y/z and yaw only."""
         sensors = self.config['sensors']['aruco']
-        
+
         # Select marker-specific or default R matrices
         if marker_id and marker_id in self.R_aruco_per_marker_pos:
             R_pos = self.R_aruco_per_marker_pos[marker_id]
-            R_ori = self.R_aruco_per_marker_ori[marker_id]
+            R_yaw = self.R_aruco_per_marker_yaw[marker_id]
         else:
             R_pos = self.R_aruco_pos
-            R_ori = self.R_aruco_ori
-        
-        # === Position Update ===
-        if sensors['position_update']:
-            H = np.zeros((3, 10))
-            H[0, 0] = H[1, 1] = H[2, 2] = 1.0
-            
-            y = z_pos - H @ self.state
-            S = H @ self.P @ H.T + R_pos
-            S_inv = np.linalg.inv(S)
-            
-            # Mahalanobis gate (chi-squared, 3 DOF)
-            mahal_sq = float(y.T @ S_inv @ y)
-            gate = self.mahal_gates.get('aruco_position', 11.345)
-            
-            if gate > 0 and mahal_sq > gate:
-                if self.debug_config['log_innovations']:
-                    rospy.logwarn(
-                        f"[ARUCO POS] REJECTED marker={marker_id} "
-                        f"Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
-                        f"innovation=[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]"
-                    )
-                return  # Skip entire update (position and orientation)
-            
-            K = self.P @ H.T @ S_inv
-            self.state = self.state + K @ y
-            I_KH = np.eye(10) - K @ H
-            self.P = I_KH @ self.P @ I_KH.T + K @ R_pos @ K.T
-            
-            if self.debug_config['log_innovations']:
-                rospy.loginfo_throttle(2.0,
-                    f"[ARUCO POS] marker={marker_id} Mahal²={mahal_sq:.2f} "
-                    f"Innovation: [{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]"
-                )
-        
-        # === Orientation Update ===
-        if sensors['orientation_update']:
-            q_est = self.state[6:10]
-            q_meas = z_quat
-            
-            q_est_inv = self.quaternion_conjugate(q_est)
-            q_err = self.quaternion_multiply(q_meas, q_est_inv)
-            rot_err = self.quaternion_to_rotation_vector(q_err)
-            
-            H_q = np.zeros((3, 10))
-            H_q[0:3, 6:9] = np.eye(3)
-            
-            y_rot = rot_err
-            P_q = self.P[6:10, 6:10]
-            S_rot = H_q[:, 6:10] @ P_q @ H_q[:, 6:10].T + R_ori
-            S_rot_inv = np.linalg.inv(S_rot)
-            
-            # Mahalanobis gate (chi-squared, 3 DOF)
-            mahal_sq_ori = float(y_rot.T @ S_rot_inv @ y_rot)
-            gate_ori = self.mahal_gates.get('aruco_orientation', 11.345)
-            
-            if gate_ori > 0 and mahal_sq_ori > gate_ori:
-                if self.debug_config['log_innovations']:
-                    rospy.logwarn(
-                        f"[ARUCO ORI] REJECTED marker={marker_id} "
-                        f"Mahal²={mahal_sq_ori:.1f} > gate={gate_ori:.1f}"
-                    )
-                self.publish_estimates(header)
+            R_yaw = self.R_aruco_yaw
+
+        if sensors.get('position_update', True):
+            if self.update_position_xyz(z_pos, R_pos, header, 'aruco', 'position',
+                                        'aruco_position', 11.345,
+                                        f"ARUCO POS marker={marker_id}"):
                 return
-            
-            K_full = self.P[:, 6:10] @ H_q[:, 6:10].T @ S_rot_inv
-            delta_state = K_full @ y_rot
-            self.state[0:6] += delta_state[0:6]
-            
-            delta_q = self.rotation_vector_to_quaternion(delta_state[6:9])
-            self.state[6:10] = self.quaternion_multiply(delta_q, q_est)
-            self.state[6:10] = self.normalize_quaternion(self.state[6:10])
-            
-            I_KH = np.eye(10) - K_full @ H_q
-            self.P = I_KH @ self.P @ I_KH.T + K_full @ R_ori @ K_full.T
-            
-            if self.debug_config['log_innovations']:
-                rospy.loginfo_throttle(2.0,
-                    f"[ARUCO ORI] marker={marker_id} Mahal²={mahal_sq_ori:.2f} "
-                    f"Rot Error: {np.degrees(rot_err)}"
-                )
-        
+
+        if sensors.get('orientation_update', True):
+            self.update_yaw(z_quat, R_yaw, header, 'aruco', 'yaw',
+                            'aruco_yaw', 6.635,
+                            f"ARUCO YAW marker={marker_id}")
+
         self.publish_estimates(header)
+
+    def transform_thermal_to_drone_frame(self, msg):
+        """Transform thermal detector output to drone pose in landpad frame."""
+        # Thermal detector should publish landpad pose in the thermal camera frame.
+        T_thermal_landpad = self.pose_msg_to_matrix(msg.pose.position, msg.pose.orientation)
+        T_drone_thermal = self.transforms.get('T_thermal_to_drone', self.transforms['T_cam_to_drone'])
+        T_drone_landpad = np.dot(T_drone_thermal, T_thermal_landpad)
+        T_landpad_drone = tft.inverse_matrix(T_drone_landpad)
+        return T_landpad_drone[:3, 3], tft.quaternion_from_matrix(T_landpad_drone)
+
+    def thermal_callback(self, msg):
+        """Thermal camera measurement update: x/y/z + yaw only."""
+        if self.is_stale(msg.header, 'thermal'):
+            rospy.logwarn_throttle(2.0, "[THERMAL] Dropping stale measurement")
+            return
+
+        pos_drone_landpad, quat_drone_landpad = self.transform_thermal_to_drone_frame(msg)
+        if not self.finite_pose(pos_drone_landpad, quat_drone_landpad):
+            rospy.logwarn_throttle(2.0, "[THERMAL] Dropping invalid measurement")
+            return
+
+        self.sensor_status.last_thermal_time = rospy.Time.now().to_sec()
+        self.publish_thermal_measurement(msg.header, pos_drone_landpad, quat_drone_landpad)
+
+        if self.mode == EKFState.WAITING:
+            if self.config.get('sensors', {}).get('thermal', {}).get('allow_initialization', False):
+                self.initialize_from_aruco(pos_drone_landpad, quat_drone_landpad)
+                self.mode = EKFState.TRACKING
+                rospy.loginfo("[EKF] Initialized from thermal measurement")
+            return
+
+        self.update_position_xyz(pos_drone_landpad, self.R_thermal_pos, msg.header,
+                                 'thermal', 'position', 'thermal_position', 11.345,
+                                 "THERMAL POS")
+        self.update_yaw(quat_drone_landpad, self.R_thermal_yaw, msg.header,
+                        'thermal', 'yaw', 'thermal_yaw', 6.635,
+                        "THERMAL YAW")
+        self.publish_estimates(msg.header)
+
+    def update_position_xyz(self, z_pos, R_pos, header, sensor_name, component,
+                            legacy_gate_key, default_gate, log_prefix):
+        """Shared x/y/z position update. Returns True if rejected."""
+        H = np.zeros((3, 10))
+        H[0, 0] = H[1, 1] = H[2, 2] = 1.0
+        y = z_pos - H @ self.state
+        S = H @ self.P @ H.T + R_pos
+        S_inv = np.linalg.inv(S)
+        rejected, mahal_sq, gate = self.mahalanobis_reject(
+            y, S_inv, sensor_name, component, legacy_gate_key, default_gate
+        )
+        if rejected:
+            if self.debug_config['log_innovations']:
+                rospy.logwarn_throttle(1.0,
+                    f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
+                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]")
+            return True
+
+        K = self.P @ H.T @ S_inv
+        self.state = self.state + K @ y
+        I_KH = np.eye(10) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_pos @ K.T
+        if self.debug_config['log_innovations']:
+            rospy.loginfo_throttle(2.0,
+                f"[{log_prefix}] Mahal²={mahal_sq:.2f} Innovation="
+                f"[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]")
+        return False
+
+    def update_yaw(self, z_quat, R_yaw, header, sensor_name, component,
+                   legacy_gate_key, default_gate, log_prefix):
+        """Yaw-only update using a small-angle error around landpad Z."""
+        yaw_est = self.yaw_from_quaternion(self.state[6:10])
+        yaw_meas = self.yaw_from_quaternion(z_quat)
+        y = np.array([self.wrap_angle(yaw_meas - yaw_est)])
+
+        # Quaternion covariance is still represented in the legacy full-state P.
+        # Use qz as the yaw-error proxy to preserve the existing state layout.
+        H = np.zeros((1, 10))
+        H[0, 8] = 1.0
+        S = H @ self.P @ H.T + R_yaw
+        S_inv = np.linalg.inv(S)
+        rejected, mahal_sq, gate = self.mahalanobis_reject(
+            y, S_inv, sensor_name, component, legacy_gate_key, default_gate
+        )
+        if rejected:
+            if self.debug_config['log_innovations']:
+                rospy.logwarn_throttle(1.0,
+                    f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
+                    f"yaw innovation={np.degrees(y[0]):.2f} deg")
+            return True
+
+        K = self.P @ H.T @ S_inv
+        delta_state = (K @ y).flatten()
+        self.state[0:6] += delta_state[0:6]
+        delta_yaw = delta_state[8]
+        delta_q = self.rotation_vector_to_quaternion(np.array([0.0, 0.0, delta_yaw]))
+        self.state[6:10] = self.quaternion_multiply(delta_q, self.state[6:10])
+        self.state[6:10] = self.normalize_quaternion(self.state[6:10])
+
+        I_KH = np.eye(10) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_yaw @ K.T
+        if self.debug_config['log_innovations']:
+            rospy.loginfo_throttle(2.0,
+                f"[{log_prefix}] Mahal²={mahal_sq:.2f} Yaw innovation={np.degrees(y[0]):.2f} deg")
+        return False
+
     # =========================================================================
     # MEASUREMENT UPDATE: LASER ALTIMETER
     # =========================================================================
@@ -934,11 +1065,9 @@ class DroneEKF:
         S = H @ self.P @ H.T + self.R_laser
         S_inv = np.linalg.inv(S)
         
-        # Mahalanobis gate (chi-squared, 1 DOF) - disabled if gate < 0
-        mahal_sq = float(y.T @ S_inv @ y)
-        gate = self.mahal_gates.get('laser', -1.0)
-        
-        if gate > 0 and mahal_sq > gate:
+        # Optional legacy laser gate remains disabled by default.
+        rejected, mahal_sq, gate = self.mahalanobis_reject(y, S_inv, 'laser', 'z', 'laser', 6.635)
+        if rejected:
             if self.debug_config['log_innovations']:
                 rospy.logwarn(
                     f"[LASER] REJECTED Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
@@ -1003,11 +1132,8 @@ class DroneEKF:
         S = H @ self.P @ H.T + self.R_uwb
         S_inv = np.linalg.inv(S)
         
-        # Mahalanobis gate (chi-squared, 2 DOF) - disabled if gate < 0
-        mahal_sq = float(y.T @ S_inv @ y)
-        gate = self.mahal_gates.get('uwb', -1.0)
-        
-        if gate > 0 and mahal_sq > gate:
+        rejected, mahal_sq, gate = self.mahalanobis_reject(y, S_inv, 'uwb', 'xy', 'uwb', 9.210)
+        if rejected:
             if self.debug_config['log_innovations']:
                 rospy.logwarn(
                     f"[UWB] REJECTED Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
@@ -1095,7 +1221,7 @@ class DroneEKF:
 
         self.publish_diagnostics(header)
     
-    def publish_aruco_measurement(self, header, position, quaternion):
+    def publish_aruco_measurement(self, header, position, quaternion, marker_id=None):
         """Publish transformed ArUco measurement."""
         msg = PoseStamped()
         msg.header.stamp = header.stamp
@@ -1108,6 +1234,22 @@ class DroneEKF:
         msg.pose.orientation.z = quaternion[2]
         msg.pose.orientation.w = quaternion[3]
         self.aruco_meas_pub.publish(msg)
+        if marker_id in getattr(self, 'aruco_marker_meas_pubs', {}):
+            self.aruco_marker_meas_pubs[marker_id].publish(msg)
+
+    def publish_thermal_measurement(self, header, position, quaternion):
+        """Publish transformed thermal measurement."""
+        msg = PoseStamped()
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = "landpad"
+        msg.pose.position.x = position[0]
+        msg.pose.position.y = position[1]
+        msg.pose.position.z = position[2]
+        msg.pose.orientation.x = quaternion[0]
+        msg.pose.orientation.y = quaternion[1]
+        msg.pose.orientation.z = quaternion[2]
+        msg.pose.orientation.w = quaternion[3]
+        self.thermal_meas_pub.publish(msg)
     
     def publish_laser_measurement(self, header, z_value):
         """Publish transformed laser measurement."""

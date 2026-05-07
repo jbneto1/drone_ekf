@@ -55,6 +55,14 @@ sensors:
         topic: '/aruco/pose/marker_682'
         position_noise: [0.10, 0.10, 0.15]
         orientation_noise_rvec: [0.10, 0.10, 0.10]
+
+  thermal:
+    enabled: true
+    topic: '/thermal/pose'
+    position_update: true
+    orientation_update: true   # yaw-only in EKF
+    allow_initialization: false
+    max_age: 0.5
     
   laser:
     enabled: true          # ✅ Laser provides Z measurement updates
@@ -105,7 +113,12 @@ process_model:
 measurement_noise:
   aruco:
     position: [0.3, 0.3, 0.5]           # x, y, z measurement noise (reduced trust due to noise)
-    orientation_rvec: [0.2, 0.2, 0.2]   # quaternion measurement noise
+    orientation_rvec: [0.2, 0.2, 0.2]   # legacy roll/pitch/yaw noise vector
+    yaw: 0.2                             # yaw-only update noise
+
+  thermal:
+    position: [0.4, 0.4, 0.6]
+    yaw: 0.3
     
   laser:
     z: [0.05]                            # z-only measurement noise (very accurate)
@@ -128,11 +141,27 @@ measurement_noise:
 #  2   |  5.991   9.210  13.816    (UWB: x,y)
 #  3   |  7.815  11.345  16.266    (ArUco: x,y,z or roll,pitch,yaw)
 #
+mahalanobis:
+  aruco:
+    enabled: false
+    position_threshold: 11.345   # 3 DOF, 99% confidence
+    yaw_threshold: 6.635         # 1 DOF, 99% confidence
+  uwb:
+    enabled: false
+    xy_threshold: 9.210          # 2 DOF, 99% confidence
+  thermal:
+    enabled: false
+    position_threshold: 11.345   # 3 DOF, 99% confidence
+    yaw_threshold: 6.635         # 1 DOF, 99% confidence
+
+# Backward-compatible legacy thresholds. Negative means disabled.
 mahalanobis_gates:
-  aruco_position: -1       # 3 DOF, 95% confidence
-  aruco_orientation: -1    # 3 DOF, 95% confidence
-  laser: -1                 # DISABLE (-1 = no gate)
-  uwb: -1                   # 
+  aruco_position: -1
+  aruco_yaw: -1
+  thermal_position: -1
+  thermal_yaw: -1
+  laser: -1
+  uwb: -1
 
 # -----------------------------------------------------------------------------
 # STATIC TRANSFORMS (4x4 Homogeneous Transformation Matrices)
@@ -151,6 +180,16 @@ transforms:
        1.0,  0.0,  0.0, -0.030,   # ✓ drone_y = cam_x
        0.0,  0.0, -1.0, -0.100,   # ✓ drone_z = -cam_z
        0.0,  0.0,  0.0,  1.000
+    ]
+
+  # Thermal camera to Drone transform. Calibrate separately if thermal camera
+  # is not physically colocated/aligned with the stereo camera.
+  T_thermal_to_drone:
+    matrix: [
+       0.0, 1.0,  0.0,  0.153,
+       1.0, 0.0,  0.0, -0.030,
+       0.0, 0.0, -1.0, -0.100,
+       0.0, 0.0,  0.0,  1.000
     ]
     
   # Laser altimeter to Drone transform
@@ -204,6 +243,8 @@ output_topics:
   
   # Per-sensor measurement topics (transformed to landpad frame)
   aruco_measurement: '/ekf/measurements/aruco'
+  aruco_marker_measurement_prefix: '/ekf/measurements/aruco/marker_'
+  thermal_measurement: '/ekf/measurements/thermal'
   laser_measurement: '/ekf/measurements/laser'
   uwb_measurement: '/ekf/measurements/uwb'
   
