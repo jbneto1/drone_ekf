@@ -57,7 +57,7 @@ sensors:
         orientation_noise_rvec: [0.10, 0.10, 0.10]
 
   thermal:
-    enabled: true
+    enabled: false
     topic: '/thermal/pose'
     position_update: true
     orientation_update: true   # yaw-only in EKF
@@ -70,7 +70,7 @@ sensors:
     field: 'bottom_clearance'  # Which field to use from Altitude message
     
   uwb:
-    enabled: true            # ✅ UWB provides X,Y measurement updates
+    enabled: false           # ✅ UWB provides X,Y measurement updates
     topic: '/dwm1001/id_uwb_map/pose_kf'
     
   optical_flow:
