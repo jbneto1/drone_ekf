@@ -65,23 +65,23 @@ sensors:
     max_age: 0.5
     
   laser:
-    enabled: true          # ✅ Laser provides Z measurement updates
+    enabled: true          
     topic: '/mavros/altitude'
-    field: 'bottom_clearance'  # Which field to use from Altitude message
+    field: 'bottom_clearance' # Which field to use from Altitude message
     
   uwb:
-    enabled: false           # ✅ UWB provides X,Y measurement updates
-    topic: '/dwm1001/id_uwb_map/pose_kf'
+    enabled: true           
+    topic: '/dwm1001/id_D082/pose_kf'
     
-  optical_flow:
-    enabled: false             # ❌ DISABLED: Not reliable for this use case
+  optical_flow: # Don't ever use it for now, its broken
+    enabled: false            
     flow_topic: '/mavros/px4flow/raw/optical_flow_rad'
     range_topic: '/mavros/px4flow/ground_distance'
     min_quality: 100
     
   px4_velocity:
-    enabled: true              # ✅ ENABLED: Use PX4 velocity for process model
-    topic: '/mavros/local_position/velocity_body' # Body-frame velocity for prediction step
+    enabled: true             
+    topic: '/mavros/local_position/velocity_body' 
     use_z: false
 
 # -----------------------------------------------------------------------------
