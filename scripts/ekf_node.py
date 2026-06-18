@@ -204,13 +204,13 @@ class DroneEKF:
             self.config = yaml.safe_load(f)
             
         # Debug configuration
-        self.debug_config = self.config.get('debug', {
-            'log_transforms': False,
+        debug_defaults = {
             'log_innovations': False,
             'log_covariance': False,
-            'log_prediction': False,
-            'log_measurements': False
-        })
+            'log_prediction': False
+        }
+        self.debug_config = debug_defaults.copy()
+        self.debug_config.update(self.config.get('debug', {}))
         
         rospy.loginfo(f"[EKF] Loaded config from: {config_path}")
         
@@ -266,19 +266,15 @@ class DroneEKF:
         self.Q = np.diag(q_pos + q_vel + q_ori)
         
         # Default measurement noise matrices
-        self.R_aruco_pos = np.diag(self.config['measurement_noise']['aruco']['position'])
-        self.R_aruco_ori = np.diag(self.config['measurement_noise']['aruco']['orientation_rvec'])
+        aruco_noise_cfg = self.config['measurement_noise']['aruco']
+        self.R_aruco_pos = np.diag(aruco_noise_cfg['position'])
         self.R_laser = np.diag(self.config['measurement_noise']['laser']['z'])
         self.R_uwb = np.diag(self.config['measurement_noise']['uwb']['xy'])
         self.R_flow = np.diag(self.config['measurement_noise']['optical_flow']['velocity_xy'])
 
-        # Yaw-only vision updates. Keep backward compatibility with older
-        # orientation_rvec configs by using the yaw/z component if no explicit
-        # yaw noise is configured.
-        self.R_aruco_yaw = np.array([[
-            self.config['measurement_noise']['aruco'].get(
-                'yaw', self.config['measurement_noise']['aruco']['orientation_rvec'][2])
-        ]])
+        # Yaw-only vision update variance in rad^2.
+        default_aruco_yaw_var = aruco_noise_cfg['yaw']
+        self.R_aruco_yaw = np.array([[default_aruco_yaw_var]])
         thermal_noise = self.config.get('measurement_noise', {}).get('thermal', {})
         self.R_thermal_pos = np.diag(thermal_noise.get('position',
             self.config['measurement_noise']['aruco']['position']))
@@ -286,7 +282,6 @@ class DroneEKF:
         
         # Per-marker R matrices (fall back to default if not specified)
         self.R_aruco_per_marker_pos = {}
-        self.R_aruco_per_marker_ori = {}
         self.R_aruco_per_marker_yaw = {}
         markers_cfg = self.config['sensors']['aruco'].get('markers', {})
         for marker_id_str, marker_cfg in markers_cfg.items():
@@ -295,11 +290,8 @@ class DroneEKF:
                 marker_cfg.get('position_noise',
                                self.config['measurement_noise']['aruco']['position'])
             )
-            marker_ori_noise = marker_cfg.get('orientation_noise_rvec',
-                self.config['measurement_noise']['aruco']['orientation_rvec'])
-            self.R_aruco_per_marker_ori[mid] = np.diag(marker_ori_noise)
             self.R_aruco_per_marker_yaw[mid] = np.array([[
-                marker_cfg.get('orientation_noise_yaw', marker_ori_noise[2])
+                marker_cfg.get('orientation_noise_yaw', default_aruco_yaw_var)
             ]])
             rospy.loginfo(f"[EKF] Marker {mid} R_pos diag: {np.diag(self.R_aruco_per_marker_pos[mid])}")
         
@@ -413,6 +405,18 @@ class DroneEKF:
         
         # Diagnostics publisher
         self.diagnostics_pub = rospy.Publisher('/ekf/diagnostics', DiagnosticArray, queue_size=1)
+        self.innovation_pub = rospy.Publisher(
+            topics.get('innovation_debug', '/ekf/debug/innovation'),
+            String, queue_size=200
+        )
+        self.covariance_pub = rospy.Publisher(
+            topics.get('covariance_debug', '/ekf/debug/covariance'),
+            String, queue_size=100
+        )
+        self.kalman_gain_pub = rospy.Publisher(
+            topics.get('kalman_gain_debug', '/ekf/debug/kalman_gain'),
+            String, queue_size=200
+        )
     
     def publish_static_landpad_frame(self):
         """Publish landpad frame to TF for RViz visualization."""
@@ -487,6 +491,73 @@ class DroneEKF:
         diag_array.status.append(status)
         self.diagnostics_pub.publish(diag_array)
 
+    def serialize_vector(self, values):
+        """Convert numpy vectors to JSON-safe Python floats."""
+        return [float(v) for v in np.asarray(values).flatten()]
+
+    def serialize_matrix(self, values):
+        """Convert numpy matrices to nested Python float lists."""
+        arr = np.asarray(values)
+        return [[float(v) for v in row] for row in arr]
+
+    def measurement_age_sec(self, header):
+        """Age of a measurement relative to current ROS time."""
+        if header.stamp.is_zero():
+            return 0.0
+        return float((rospy.Time.now() - header.stamp).to_sec())
+
+    def publish_json_debug(self, publisher, payload):
+        """Publish a JSON payload on a String topic."""
+        msg = String()
+        msg.data = json.dumps(payload)
+        publisher.publish(msg)
+
+    def publish_covariance_debug(self, header, source):
+        """Publish EKF covariance diagonal for offline plotting."""
+        payload = {
+            'stamp': float(header.stamp.to_sec()),
+            'source': source,
+            'p_diag': self.serialize_vector(np.diag(self.P))
+        }
+        self.publish_json_debug(self.covariance_pub, payload)
+
+    def publish_update_debug(self, header, sensor_name, component, innovation, S, R,
+                             accepted, mahal_sq, gate, K=None, marker_id=None,
+                             post_fit_residual=None, measurement_gain=None):
+        """Publish innovation, residual, and gain data for tuning plots."""
+        innovation_payload = {
+            'stamp': float(header.stamp.to_sec()),
+            'sensor': sensor_name,
+            'component': component,
+            'marker_id': int(marker_id) if marker_id is not None else None,
+            'accepted': bool(accepted),
+            'innovation': self.serialize_vector(innovation),
+            'post_fit_residual': (
+                self.serialize_vector(post_fit_residual)
+                if post_fit_residual is not None else None
+            ),
+            's_diag': self.serialize_vector(np.diag(S)),
+            'r_diag': self.serialize_vector(np.diag(R)),
+            'mahalanobis_sq': float(mahal_sq),
+            'gate_threshold': float(gate),
+            'age_sec': self.measurement_age_sec(header)
+        }
+        self.publish_json_debug(self.innovation_pub, innovation_payload)
+
+        if K is not None:
+            gain_payload = {
+                'stamp': float(header.stamp.to_sec()),
+                'sensor': sensor_name,
+                'component': component,
+                'marker_id': int(marker_id) if marker_id is not None else None,
+                'accepted': bool(accepted),
+                'shape': list(np.asarray(K).shape),
+                'kalman_gain': self.serialize_matrix(K)
+            }
+            if measurement_gain is not None:
+                gain_payload['measurement_gain'] = float(measurement_gain)
+            self.publish_json_debug(self.kalman_gain_pub, gain_payload)
+
     # =========================================================================
     # MATH HELPER FUNCTIONS
     # =========================================================================
@@ -560,6 +631,68 @@ class DroneEKF:
     def finite_pose(self, position, quaternion):
         """Reject NaN/Inf measurements before they enter the EKF."""
         return np.all(np.isfinite(position)) and np.all(np.isfinite(quaternion))
+
+    def yaw_quaternion_jacobian(self, q):
+        """Jacobian d(yaw)/d(qx,qy,qz,qw) for a normalized quaternion."""
+        qx, qy, qz, qw = self.normalize_quaternion(q)
+        numerator = 2.0 * (qw * qz + qx * qy)
+        denominator = 1.0 - 2.0 * (qy * qy + qz * qz)
+        norm_sq = numerator * numerator + denominator * denominator
+
+        if norm_sq < 1e-12:
+            return np.array([0.0, 0.0, 2.0, 0.0])
+
+        d_num = np.array([2.0 * qy, 2.0 * qx, 2.0 * qw, 2.0 * qz])
+        d_den = np.array([0.0, -4.0 * qy, -4.0 * qz, 0.0])
+        return (denominator * d_num - numerator * d_den) / norm_sq
+
+    def right_quaternion_product_matrix(self, q_delta):
+        """Matrix such that q_current ⊗ q_delta = M(q_delta) q_current."""
+        x2, y2, z2, w2 = q_delta
+        return np.array([
+            [w2,  z2, -y2, x2],
+            [-z2, w2,  x2, y2],
+            [y2, -x2,  w2, z2],
+            [-x2, -y2, -z2, w2]
+        ])
+
+    def rotated_velocity_quaternion_jacobian(self, q, v_body):
+        """Numerical Jacobian d(R(q) v_body)/d(qx,qy,qz,qw)."""
+        eps = 1e-6
+        q = self.normalize_quaternion(q)
+        jac = np.zeros((3, 4))
+
+        for idx in range(4):
+            dq = np.zeros(4)
+            dq[idx] = eps
+            q_plus = self.normalize_quaternion(q + dq)
+            q_minus = self.normalize_quaternion(q - dq)
+            v_plus = self.quaternion_to_rotation_matrix(q_plus) @ v_body
+            v_minus = self.quaternion_to_rotation_matrix(q_minus) @ v_body
+            jac[:, idx] = (v_plus - v_minus) / (2.0 * eps)
+
+        return jac
+
+    def stabilize_covariance(self):
+        """Keep P symmetric after linearized prediction/update steps."""
+        self.P = 0.5 * (self.P + self.P.T)
+
+    def normalize_state_quaternion(self):
+        """Normalize the state quaternion and project P through that operation."""
+        q = self.state[6:10].copy()
+        norm = np.linalg.norm(q)
+
+        if norm <= 1e-6:
+            self.state[6:10] = np.array([0.0, 0.0, 0.0, 1.0])
+            return
+
+        q_normalized = q / norm
+        J_norm = (np.eye(4) - np.outer(q_normalized, q_normalized)) / norm
+        A = np.eye(10)
+        A[6:10, 6:10] = J_norm
+        self.state[6:10] = q_normalized
+        self.P = A @ self.P @ A.T
+        self.stabilize_covariance()
 
     def is_stale(self, header, sensor_name):
         """Return True when a timestamped measurement is too old. Disabled by default."""
@@ -728,9 +861,10 @@ class DroneEKF:
         # Covariance update (Joseph form for numerical stability)
         I_KH = np.eye(10) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R_flow @ K.T
+        self.stabilize_covariance()
         
         # Normalize quaternion (in case numerical errors accumulated)
-        self.state[6:10] = self.normalize_quaternion(self.state[6:10])
+        self.normalize_state_quaternion()
         
         # Publish updated estimates
         self.publish_estimates(header)
@@ -750,8 +884,9 @@ class DroneEKF:
         v_body = self.last_body_velocity.copy()
         
         # Get current orientation estimate from EKF state
-        q_ekf = self.state[6:10]
-        R_body_to_landpad = self.quaternion_to_rotation_matrix(q_ekf)
+        self.normalize_state_quaternion()
+        q_prior = self.state[6:10].copy()
+        R_body_to_landpad = self.quaternion_to_rotation_matrix(q_prior)
         
         # Transform body velocity to landpad frame
         v_landpad = R_body_to_landpad @ v_body
@@ -781,11 +916,14 @@ class DroneEKF:
         self.dead_reckoning_quat = self.normalize_quaternion(self.dead_reckoning_quat)
         
         # === Covariance Prediction ===
+        vel_q_jac = self.rotated_velocity_quaternion_jacobian(q_prior, v_body)
         F = np.eye(10)
-        F[0, 3] = self.dt
-        F[1, 4] = self.dt
-        F[2, 5] = self.dt
+        F[0:3, 3:6] = np.eye(3) * self.dt
+        F[0:3, 6:10] = vel_q_jac * self.dt
+        F[3:6, 6:10] = vel_q_jac
+        F[6:10, 6:10] = self.right_quaternion_product_matrix(delta_quat)
         self.P = F @ self.P @ F.T + self.Q * self.dt
+        self.normalize_state_quaternion()
         
         # === Logging ===
         if self.debug_config['log_prediction']:
@@ -908,13 +1046,15 @@ class DroneEKF:
         if sensors.get('position_update', True):
             if self.update_position_xyz(z_pos, R_pos, header, 'aruco', 'position',
                                         'aruco_position', 11.345,
-                                        f"ARUCO POS marker={marker_id}"):
+                                        f"ARUCO POS marker={marker_id}",
+                                        marker_id=marker_id):
                 return
 
         if sensors.get('orientation_update', True):
             self.update_yaw(z_quat, R_yaw, header, 'aruco', 'yaw',
                             'aruco_yaw', 6.635,
-                            f"ARUCO YAW marker={marker_id}")
+                            f"ARUCO YAW marker={marker_id}",
+                            marker_id=marker_id)
 
         self.publish_estimates(header)
 
@@ -948,16 +1088,19 @@ class DroneEKF:
                 rospy.loginfo("[EKF] Initialized from thermal measurement")
             return
 
-        self.update_position_xyz(pos_drone_landpad, self.R_thermal_pos, msg.header,
-                                 'thermal', 'position', 'thermal_position', 11.345,
-                                 "THERMAL POS")
-        self.update_yaw(quat_drone_landpad, self.R_thermal_yaw, msg.header,
-                        'thermal', 'yaw', 'thermal_yaw', 6.635,
-                        "THERMAL YAW")
+        thermal_cfg = self.config.get('sensors', {}).get('thermal', {})
+        if thermal_cfg.get('position_update', True):
+            self.update_position_xyz(pos_drone_landpad, self.R_thermal_pos, msg.header,
+                                     'thermal', 'position', 'thermal_position', 11.345,
+                                     "THERMAL POS")
+        if thermal_cfg.get('orientation_update', True):
+            self.update_yaw(quat_drone_landpad, self.R_thermal_yaw, msg.header,
+                            'thermal', 'yaw', 'thermal_yaw', 6.635,
+                            "THERMAL YAW")
         self.publish_estimates(msg.header)
 
     def update_position_xyz(self, z_pos, R_pos, header, sensor_name, component,
-                            legacy_gate_key, default_gate, log_prefix):
+                            legacy_gate_key, default_gate, log_prefix, marker_id=None):
         """Shared x/y/z position update. Returns True if rejected."""
         H = np.zeros((3, 10))
         H[0, 0] = H[1, 1] = H[2, 2] = 1.0
@@ -968,6 +1111,10 @@ class DroneEKF:
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
         if rejected:
+            self.publish_update_debug(
+                header, sensor_name, component, y, S, R_pos, False,
+                mahal_sq, gate, marker_id=marker_id
+            )
             if self.debug_config['log_innovations']:
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
@@ -978,6 +1125,13 @@ class DroneEKF:
         self.state = self.state + K @ y
         I_KH = np.eye(10) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R_pos @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = z_pos - H @ self.state
+        self.publish_update_debug(
+            header, sensor_name, component, y, S, R_pos, True,
+            mahal_sq, gate, K=K, marker_id=marker_id,
+            post_fit_residual=post_fit_residual
+        )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
                 f"[{log_prefix}] Mahal²={mahal_sq:.2f} Innovation="
@@ -985,22 +1139,27 @@ class DroneEKF:
         return False
 
     def update_yaw(self, z_quat, R_yaw, header, sensor_name, component,
-                   legacy_gate_key, default_gate, log_prefix):
+                   legacy_gate_key, default_gate, log_prefix, marker_id=None):
         """Yaw-only update using a small-angle error around landpad Z."""
+        self.normalize_state_quaternion()
         yaw_est = self.yaw_from_quaternion(self.state[6:10])
         yaw_meas = self.yaw_from_quaternion(z_quat)
         y = np.array([self.wrap_angle(yaw_meas - yaw_est)])
 
-        # Quaternion covariance is still represented in the legacy full-state P.
-        # Use qz as the yaw-error proxy to preserve the existing state layout.
+        # The measurement is yaw, not qz. Linearize yaw(q) around the current
+        # quaternion so the innovation units (rad) match the measurement model.
         H = np.zeros((1, 10))
-        H[0, 8] = 1.0
+        H[0, 6:10] = self.yaw_quaternion_jacobian(self.state[6:10])
         S = H @ self.P @ H.T + R_yaw
         S_inv = np.linalg.inv(S)
         rejected, mahal_sq, gate = self.mahalanobis_reject(
             y, S_inv, sensor_name, component, legacy_gate_key, default_gate
         )
         if rejected:
+            self.publish_update_debug(
+                header, sensor_name, component, y, S, R_yaw, False,
+                mahal_sq, gate, marker_id=marker_id
+            )
             if self.debug_config['log_innovations']:
                 rospy.logwarn_throttle(1.0,
                     f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
@@ -1010,13 +1169,21 @@ class DroneEKF:
         K = self.P @ H.T @ S_inv
         delta_state = (K @ y).flatten()
         self.state[0:6] += delta_state[0:6]
-        delta_yaw = delta_state[8]
-        delta_q = self.rotation_vector_to_quaternion(np.array([0.0, 0.0, delta_yaw]))
-        self.state[6:10] = self.quaternion_multiply(delta_q, self.state[6:10])
-        self.state[6:10] = self.normalize_quaternion(self.state[6:10])
+        self.state[6:10] = self.state[6:10] + delta_state[6:10]
 
         I_KH = np.eye(10) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R_yaw @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = np.array([
+            self.wrap_angle(yaw_meas - self.yaw_from_quaternion(self.state[6:10]))
+        ])
+        measurement_gain = float((H @ K)[0, 0])
+        self.publish_update_debug(
+            header, sensor_name, component, y, S, R_yaw, True,
+            mahal_sq, gate, K=K, marker_id=marker_id,
+            post_fit_residual=post_fit_residual,
+            measurement_gain=measurement_gain
+        )
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
                 f"[{log_prefix}] Mahal²={mahal_sq:.2f} Yaw innovation={np.degrees(y[0]):.2f} deg")
@@ -1068,6 +1235,10 @@ class DroneEKF:
         # Optional legacy laser gate remains disabled by default.
         rejected, mahal_sq, gate = self.mahalanobis_reject(y, S_inv, 'laser', 'z', 'laser', 6.635)
         if rejected:
+            self.publish_update_debug(
+                msg.header, 'laser', 'z', y, S, self.R_laser, False,
+                mahal_sq, gate
+            )
             if self.debug_config['log_innovations']:
                 rospy.logwarn(
                     f"[LASER] REJECTED Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
@@ -1079,6 +1250,12 @@ class DroneEKF:
         self.state = self.state + (K @ y).flatten()
         I_KH = np.eye(10) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R_laser @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = z - H @ self.state
+        self.publish_update_debug(
+            msg.header, 'laser', 'z', y, S, self.R_laser, True,
+            mahal_sq, gate, K=K, post_fit_residual=post_fit_residual
+        )
         
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1134,6 +1311,10 @@ class DroneEKF:
         
         rejected, mahal_sq, gate = self.mahalanobis_reject(y, S_inv, 'uwb', 'xy', 'uwb', 9.210)
         if rejected:
+            self.publish_update_debug(
+                msg.header, 'uwb', 'xy', y, S, self.R_uwb, False,
+                mahal_sq, gate
+            )
             if self.debug_config['log_innovations']:
                 rospy.logwarn(
                     f"[UWB] REJECTED Mahal²={mahal_sq:.1f} > gate={gate:.1f} | "
@@ -1145,6 +1326,12 @@ class DroneEKF:
         self.state = self.state + (K @ y).flatten()
         I_KH = np.eye(10) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R_uwb @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = z - H @ self.state
+        self.publish_update_debug(
+            msg.header, 'uwb', 'xy', y, S, self.R_uwb, True,
+            mahal_sq, gate, K=K, post_fit_residual=post_fit_residual
+        )
         
         if self.debug_config['log_innovations']:
             rospy.loginfo_throttle(2.0,
@@ -1179,9 +1366,10 @@ class DroneEKF:
         odom_msg.header.frame_id = "landpad"
         odom_msg.child_frame_id = "base_link_ekf"
         odom_msg.pose.pose = pose_msg.pose
-        odom_msg.twist.twist.linear.x = self.state[3]
-        odom_msg.twist.twist.linear.y = self.state[4]
-        odom_msg.twist.twist.linear.z = self.state[5]
+        v_body = self.quaternion_to_rotation_matrix(self.state[6:10]).T @ self.state[3:6]
+        odom_msg.twist.twist.linear.x = v_body[0]
+        odom_msg.twist.twist.linear.y = v_body[1]
+        odom_msg.twist.twist.linear.z = v_body[2]
         for i in range(3):
             odom_msg.pose.covariance[i*7] = self.P[i, i]
         self.ekf_odom_pub.publish(odom_msg)
@@ -1212,6 +1400,7 @@ class DroneEKF:
         t.transform.rotation.z = self.state[8]
         t.transform.rotation.w = self.state[9]
         self.tf_broadcaster.sendTransform(t)
+        self.publish_covariance_debug(header, 'publish_estimate')
         
         if self.debug_config['log_covariance']:
             rospy.loginfo_throttle(2.0, 

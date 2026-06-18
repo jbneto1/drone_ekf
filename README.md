@@ -5,7 +5,7 @@ Extended Kalman Filter for fusing drone odometry with ArUco marker measurements.
 ## 📋 Overview
 
 This package implements a simple EKF that:
-- **Predicts** drone state using `/mavros/local_position/odom` (process model)
+- **Predicts** drone state using PX4 body velocity from `/mavros/local_position/velocity_body`
 - **Corrects** predictions using `/aruco/pose` measurements (update step)
 - **Publishes** filtered estimates to `/ekf/pose` and `/ekf/odom`
 - **Plots** raw vs filtered data in real-time for tuning

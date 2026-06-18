@@ -6,7 +6,7 @@ roslaunch drone_ekf ekf.launch \
 
 T2
 
-rosrun iris_land aruco_stereo --debug --no-viz
+roslaunch iris_land aruco_stereo.launch debug:=true visualization:=false
 
 T3 
 
@@ -27,6 +27,7 @@ rosbag record -O optionA_v9_outputs.bag \
 /aruco/pose/marker_363 \
 /aruco/pose/marker_417 \
 /aruco/pose/marker_682 \
+/aruco/debug/marker_quality \
 /ekf/pose \
 /ekf/odom \
 /ekf/dead_reckoning \
@@ -35,6 +36,9 @@ rosbag record -O optionA_v9_outputs.bag \
 /ekf/measurements/aruco/marker_417 \
 /ekf/measurements/aruco/marker_682 \
 /ekf/measurements/laser \
+/ekf/debug/innovation \
+/ekf/debug/covariance \
+/ekf/debug/kalman_gain \
 /ekf/sensor_status \
 /ekf/diagnostics \
 /controller/offline_frame_probe \
