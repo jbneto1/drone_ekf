@@ -6,7 +6,7 @@ roslaunch drone_ekf ekf.launch \
 
 T2
 
-roslaunch iris_land aruco_stereo.launch debug:=true visualization:=false
+roslaunch iris_land aruco_stereo.launch
 
 T3 
 

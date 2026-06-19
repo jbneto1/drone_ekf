@@ -3,7 +3,7 @@
 #
 # Current active architecture:
 # - Prediction: PX4 body-frame velocity + body angular rate
-# - Updates: ArUco x/y/z + yaw, laser z, optional UWB x/y
+# - Updates: ArUco x/y + z + yaw, laser z, optional UWB x/y
 # - State frame: drone pose expressed in the landpad frame
 # =============================================================================
 
@@ -30,22 +30,24 @@ initialization:
 sensors:
   aruco:
     enabled: true
-    position_update: true         # x/y/z update
+    position_update: true         # legacy parent switch for ArUco position updates
+    xy_update: true               # x/y update, independently gated
+    z_update: true                # z update, independently gated
     orientation_update: true      # yaw-only update
     max_age: 0.0                  # seconds; 0 disables stale-measurement rejection
     markers:
       417:
         topic: '/aruco/pose/marker_417'
-        position_noise: [0.012, 0.012, 0.04]      # variance [m^2]
-        orientation_noise_yaw: 0.006             # variance [rad^2]
+        position_noise: [0.04, 0.04, 0.08]      # variance [m^2]
+        orientation_noise_yaw: 0.03             # variance [rad^2]
       363:
         topic: '/aruco/pose/marker_363'
-        position_noise: [0.03, 0.03, 0.06]      # variance [m^2]
-        orientation_noise_yaw: 0.012             # variance [rad^2]
+        position_noise: [0.08, 0.08, 0.12]      # variance [m^2]
+        orientation_noise_yaw: 0.05             # variance [rad^2]
       682:
         topic: '/aruco/pose/marker_682'
-        position_noise: [0.05, 0.05, 0.09]      # variance [m^2]
-        orientation_noise_yaw: 0.02             # variance [rad^2]
+        position_noise: [0.12, 0.12, 0.20]      # variance [m^2]
+        orientation_noise_yaw: 0.08             # variance [rad^2]
 
   thermal:
     enabled: false
@@ -78,9 +80,9 @@ process_model:
   # This is PX4 velocity dead reckoning, not raw IMU mechanization.
   type: 'PX4_Velocity'
   Q:
-    position: [0.01, 0.01, 0.0005]           # variance [m^2 / s]
-    velocity: [0.25, 0.25, 0.02]            # variance [(m/s)^2 / s]
-    orientation: [0.0003, 0.0003, 0.0015, 0.0003]   # quaternion-component variance / s
+    position: [0.02, 0.02, 0.001]           # variance [m^2 / s]
+    velocity: [0.50, 0.50, 0.02]            # variance [(m/s)^2 / s]
+    orientation: [0.02, 0.02, 0.02, 0.02]   # quaternion-component variance / s
 
 measurement_noise:
   aruco:
@@ -93,7 +95,7 @@ measurement_noise:
     yaw: 0.09                      # [rad^2]
 
   laser:
-    z: [0.004]                      # [m^2]
+    z: [0.01]                      # [m^2]
 
   uwb:
     xy: [0.25, 0.25]               # [m^2]
@@ -103,9 +105,12 @@ measurement_noise:
 
 mahalanobis:
   aruco:
-    enabled: true
-    position_threshold: 30.0     # arbitrary, not 2DOF chi^2
-    yaw_threshold: 6.635           # chi^2, 1 DOF, 99%
+    # Master switch. Optional per-component overrides are xy_enabled,
+    # z_enabled, and yaw_enabled if you want to gate only some components.
+    enabled: false
+    xy_threshold: 9.210           # chi^2, 2 DOF, 99%
+    z_threshold: 6.635            # chi^2, 1 DOF, 99%
+    yaw_threshold: 6.635          # chi^2, 1 DOF, 99%
   laser:
     enabled: false
     z_threshold: 6.635            # chi^2, 1 DOF, 99%

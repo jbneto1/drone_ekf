@@ -299,6 +299,8 @@ class DroneEKF:
         # old-style negative thresholds still disable gates for compatibility.
         self.mahal_gates = self.config.get('mahalanobis_gates', {
             'aruco_position': -1.0,
+            'aruco_xy': -1.0,
+            'aruco_z': -1.0,
             'aruco_yaw': -1.0,
             'thermal_position': -1.0,
             'thermal_yaw': -1.0,
@@ -706,12 +708,21 @@ class DroneEKF:
         """Read Mahalanobis gate settings with explicit flags and old-key fallback."""
         sensor_gate = self.mahal_cfg.get(sensor_name, {})
         if sensor_gate:
-            enabled = bool(sensor_gate.get('enabled', False))
-            threshold = sensor_gate.get(f'{component}_threshold',
-                                        sensor_gate.get('threshold', default_threshold))
+            enabled = bool(sensor_gate.get(f'{component}_enabled',
+                                           sensor_gate.get('enabled', False)))
+            threshold = sensor_gate.get(f'{component}_threshold')
+            if threshold is None and component in ('xy', 'z'):
+                threshold = sensor_gate.get('position_threshold')
+            if threshold is None:
+                threshold = sensor_gate.get('threshold', default_threshold)
             return enabled, float(threshold)
 
-        threshold = float(self.mahal_gates.get(legacy_key, -1.0))
+        threshold = self.mahal_gates.get(legacy_key)
+        if threshold is None and component in ('xy', 'z'):
+            threshold = self.mahal_gates.get(f'{sensor_name}_position', -1.0)
+        if threshold is None:
+            threshold = -1.0
+        threshold = float(threshold)
         return threshold > 0.0, threshold
 
     def mahalanobis_reject(self, innovation, S_inv, sensor_name, component, legacy_key, default_threshold):
@@ -1032,7 +1043,7 @@ class DroneEKF:
         rospy.loginfo(f"[EKF] Initialized with yaw: {yaw:.1f}°")
     
     def update_aruco(self, z_pos, z_quat, header, marker_id=None):
-        """EKF update using ArUco x/y/z and yaw only."""
+        """EKF update using independently gated ArUco x/y, z, and yaw."""
         sensors = self.config['sensors']['aruco']
 
         # Select marker-specific or default R matrices
@@ -1044,11 +1055,16 @@ class DroneEKF:
             R_yaw = self.R_aruco_yaw
 
         if sensors.get('position_update', True):
-            if self.update_position_xyz(z_pos, R_pos, header, 'aruco', 'position',
-                                        'aruco_position', 11.345,
-                                        f"ARUCO POS marker={marker_id}",
-                                        marker_id=marker_id):
-                return
+            if sensors.get('xy_update', True):
+                self.update_position_xy(z_pos, R_pos, header, 'aruco', 'xy',
+                                        'aruco_xy', 9.210,
+                                        f"ARUCO XY marker={marker_id}",
+                                        marker_id=marker_id)
+            if sensors.get('z_update', True):
+                self.update_position_z(z_pos, R_pos, header, 'aruco', 'z',
+                                       'aruco_z', 6.635,
+                                       f"ARUCO Z marker={marker_id}",
+                                       marker_id=marker_id)
 
         if sensors.get('orientation_update', True):
             self.update_yaw(z_quat, R_yaw, header, 'aruco', 'yaw',
@@ -1136,6 +1152,87 @@ class DroneEKF:
             rospy.loginfo_throttle(2.0,
                 f"[{log_prefix}] Mahal²={mahal_sq:.2f} Innovation="
                 f"[{y[0]:.3f}, {y[1]:.3f}, {y[2]:.3f}]")
+        return False
+
+    def update_position_xy(self, z_pos, R_pos, header, sensor_name, component,
+                           legacy_gate_key, default_gate, log_prefix, marker_id=None):
+        """Shared x/y position update. Returns True if rejected."""
+        H = np.zeros((2, 10))
+        H[0, 0] = H[1, 1] = 1.0
+        z = z_pos[:2]
+        R_xy = R_pos[:2, :2]
+        y = z - H @ self.state
+        S = H @ self.P @ H.T + R_xy
+        S_inv = np.linalg.inv(S)
+        rejected, mahal_sq, gate = self.mahalanobis_reject(
+            y, S_inv, sensor_name, component, legacy_gate_key, default_gate
+        )
+        if rejected:
+            self.publish_update_debug(
+                header, sensor_name, component, y, S, R_xy, False,
+                mahal_sq, gate, marker_id=marker_id
+            )
+            if self.debug_config['log_innovations']:
+                rospy.logwarn_throttle(1.0,
+                    f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
+                    f"innovation=[{y[0]:.3f}, {y[1]:.3f}]")
+            return True
+
+        K = self.P @ H.T @ S_inv
+        self.state = self.state + K @ y
+        I_KH = np.eye(10) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_xy @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = z - H @ self.state
+        self.publish_update_debug(
+            header, sensor_name, component, y, S, R_xy, True,
+            mahal_sq, gate, K=K, marker_id=marker_id,
+            post_fit_residual=post_fit_residual
+        )
+        if self.debug_config['log_innovations']:
+            rospy.loginfo_throttle(2.0,
+                f"[{log_prefix}] Mahal²={mahal_sq:.2f} Innovation="
+                f"[{y[0]:.3f}, {y[1]:.3f}]")
+        return False
+
+    def update_position_z(self, z_pos, R_pos, header, sensor_name, component,
+                          legacy_gate_key, default_gate, log_prefix, marker_id=None):
+        """Shared z position update. Returns True if rejected."""
+        H = np.zeros((1, 10))
+        H[0, 2] = 1.0
+        z = np.array([z_pos[2]])
+        R_z = np.array([[R_pos[2, 2]]])
+        y = z - H @ self.state
+        S = H @ self.P @ H.T + R_z
+        S_inv = np.linalg.inv(S)
+        rejected, mahal_sq, gate = self.mahalanobis_reject(
+            y, S_inv, sensor_name, component, legacy_gate_key, default_gate
+        )
+        if rejected:
+            self.publish_update_debug(
+                header, sensor_name, component, y, S, R_z, False,
+                mahal_sq, gate, marker_id=marker_id
+            )
+            if self.debug_config['log_innovations']:
+                rospy.logwarn_throttle(1.0,
+                    f"[{log_prefix}] REJECTED Mahal²={mahal_sq:.2f} > gate={gate:.2f} | "
+                    f"innovation={y[0]:.3f}")
+            return True
+
+        K = self.P @ H.T @ S_inv
+        self.state = self.state + (K @ y).flatten()
+        I_KH = np.eye(10) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R_z @ K.T
+        self.normalize_state_quaternion()
+        post_fit_residual = z - H @ self.state
+        self.publish_update_debug(
+            header, sensor_name, component, y, S, R_z, True,
+            mahal_sq, gate, K=K, marker_id=marker_id,
+            post_fit_residual=post_fit_residual
+        )
+        if self.debug_config['log_innovations']:
+            rospy.loginfo_throttle(2.0,
+                f"[{log_prefix}] Mahal²={mahal_sq:.2f} Innovation={y[0]:.3f}")
         return False
 
     def update_yaw(self, z_quat, R_yaw, header, sensor_name, component,
