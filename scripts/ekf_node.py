@@ -566,7 +566,7 @@ class DroneEKF:
     
     def pose_msg_to_matrix(self, position, orientation):
         """Convert ROS pose message to 4x4 transformation matrix."""
-        q = [orientation.x, orientation.y, orientation.z, orientation.w]
+        q = self.normalize_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
         T = tft.quaternion_matrix(q)
         T[0, 3] = position.x
         T[1, 3] = position.y
@@ -617,8 +617,9 @@ class DroneEKF:
     
     def normalize_quaternion(self, q):
         """Normalize quaternion to unit length."""
+        q = np.asarray(q, dtype=float)
         norm = np.linalg.norm(q)
-        if norm > 1e-6:
+        if np.isfinite(norm) and norm > 1e-6:
             return q / norm
         return np.array([0.0, 0.0, 0.0, 1.0])
 
@@ -628,7 +629,7 @@ class DroneEKF:
 
     def yaw_from_quaternion(self, q):
         """Extract yaw from quaternion [x, y, z, w]."""
-        return tft.euler_from_quaternion(q)[2]
+        return tft.euler_from_quaternion(self.normalize_quaternion(q))[2]
 
     def finite_pose(self, position, quaternion):
         """Reject NaN/Inf measurements before they enter the EKF."""
@@ -684,7 +685,7 @@ class DroneEKF:
         q = self.state[6:10].copy()
         norm = np.linalg.norm(q)
 
-        if norm <= 1e-6:
+        if not np.isfinite(norm) or norm <= 1e-6:
             self.state[6:10] = np.array([0.0, 0.0, 0.0, 1.0])
             return
 
@@ -1021,12 +1022,13 @@ class DroneEKF:
         T_landpad_drone = tft.inverse_matrix(T_drone_landpad)
         
         pos_drone_landpad = T_landpad_drone[:3, 3]
-        quat_drone_landpad = tft.quaternion_from_matrix(T_landpad_drone)
+        quat_drone_landpad = self.normalize_quaternion(tft.quaternion_from_matrix(T_landpad_drone))
         
         return pos_drone_landpad, quat_drone_landpad
     
     def initialize_from_aruco(self, position, quaternion):
         """Initialize EKF from first ArUco detection."""
+        quaternion = self.normalize_quaternion(quaternion)
         self.state[0:3] = position
         self.state[3:6] = np.zeros(3)
         self.state[6:10] = quaternion
@@ -1081,7 +1083,7 @@ class DroneEKF:
         T_drone_thermal = self.transforms.get('T_thermal_to_drone', self.transforms['T_cam_to_drone'])
         T_drone_landpad = np.dot(T_drone_thermal, T_thermal_landpad)
         T_landpad_drone = tft.inverse_matrix(T_drone_landpad)
-        return T_landpad_drone[:3, 3], tft.quaternion_from_matrix(T_landpad_drone)
+        return T_landpad_drone[:3, 3], self.normalize_quaternion(tft.quaternion_from_matrix(T_landpad_drone))
 
     def thermal_callback(self, msg):
         """Thermal camera measurement update: x/y/z + yaw only."""
@@ -1443,6 +1445,16 @@ class DroneEKF:
     def publish_estimates(self, header):
         """Publish EKF estimate, dead reckoning, and TF."""
         stamp = header.stamp
+        if not np.all(np.isfinite(self.state[0:6])):
+            rospy.logwarn_throttle(
+                1.0,
+                "[EKF] Skipping estimate publish because position/velocity state is not finite"
+            )
+            return
+        state_quat = self.normalize_quaternion(self.state[6:10])
+        self.state[6:10] = state_quat
+        dead_reckoning_quat = self.normalize_quaternion(self.dead_reckoning_quat)
+        self.dead_reckoning_quat = dead_reckoning_quat
         
         # === EKF Pose ===
         pose_msg = PoseStamped()
@@ -1451,10 +1463,10 @@ class DroneEKF:
         pose_msg.pose.position.x = self.state[0]
         pose_msg.pose.position.y = self.state[1]
         pose_msg.pose.position.z = self.state[2]
-        pose_msg.pose.orientation.x = self.state[6]
-        pose_msg.pose.orientation.y = self.state[7]
-        pose_msg.pose.orientation.z = self.state[8]
-        pose_msg.pose.orientation.w = self.state[9]
+        pose_msg.pose.orientation.x = state_quat[0]
+        pose_msg.pose.orientation.y = state_quat[1]
+        pose_msg.pose.orientation.z = state_quat[2]
+        pose_msg.pose.orientation.w = state_quat[3]
         self.ekf_pose_pub.publish(pose_msg)
         
         # === EKF Odometry ===
@@ -1463,7 +1475,7 @@ class DroneEKF:
         odom_msg.header.frame_id = "landpad"
         odom_msg.child_frame_id = "base_link_ekf"
         odom_msg.pose.pose = pose_msg.pose
-        v_body = self.quaternion_to_rotation_matrix(self.state[6:10]).T @ self.state[3:6]
+        v_body = self.quaternion_to_rotation_matrix(state_quat).T @ self.state[3:6]
         odom_msg.twist.twist.linear.x = v_body[0]
         odom_msg.twist.twist.linear.y = v_body[1]
         odom_msg.twist.twist.linear.z = v_body[2]
@@ -1478,10 +1490,10 @@ class DroneEKF:
         dr_msg.pose.position.x = self.dead_reckoning_pos[0]
         dr_msg.pose.position.y = self.dead_reckoning_pos[1]
         dr_msg.pose.position.z = self.dead_reckoning_pos[2]
-        dr_msg.pose.orientation.x = self.dead_reckoning_quat[0]
-        dr_msg.pose.orientation.y = self.dead_reckoning_quat[1]
-        dr_msg.pose.orientation.z = self.dead_reckoning_quat[2]
-        dr_msg.pose.orientation.w = self.dead_reckoning_quat[3]
+        dr_msg.pose.orientation.x = dead_reckoning_quat[0]
+        dr_msg.pose.orientation.y = dead_reckoning_quat[1]
+        dr_msg.pose.orientation.z = dead_reckoning_quat[2]
+        dr_msg.pose.orientation.w = dead_reckoning_quat[3]
         self.dead_reckoning_pub.publish(dr_msg)
         
         # === TF ===
@@ -1492,10 +1504,10 @@ class DroneEKF:
         t.transform.translation.x = self.state[0]
         t.transform.translation.y = self.state[1]
         t.transform.translation.z = self.state[2]
-        t.transform.rotation.x = self.state[6]
-        t.transform.rotation.y = self.state[7]
-        t.transform.rotation.z = self.state[8]
-        t.transform.rotation.w = self.state[9]
+        t.transform.rotation.x = state_quat[0]
+        t.transform.rotation.y = state_quat[1]
+        t.transform.rotation.z = state_quat[2]
+        t.transform.rotation.w = state_quat[3]
         self.tf_broadcaster.sendTransform(t)
         self.publish_covariance_debug(header, 'publish_estimate')
         
@@ -1509,6 +1521,7 @@ class DroneEKF:
     
     def publish_aruco_measurement(self, header, position, quaternion, marker_id=None):
         """Publish transformed ArUco measurement."""
+        quaternion = self.normalize_quaternion(quaternion)
         msg = PoseStamped()
         msg.header.stamp = header.stamp
         msg.header.frame_id = "landpad"
@@ -1525,6 +1538,7 @@ class DroneEKF:
 
     def publish_thermal_measurement(self, header, position, quaternion):
         """Publish transformed thermal measurement."""
+        quaternion = self.normalize_quaternion(quaternion)
         msg = PoseStamped()
         msg.header.stamp = header.stamp
         msg.header.frame_id = "landpad"
