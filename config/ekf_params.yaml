@@ -1,265 +1,232 @@
 # =============================================================================
-# EKF Configuration for Drone Landing System
-# =============================================================================
-# This file is loaded at runtime - no catkin_make required after changes
+# EKF configuration for drone pose relative to the landpad frame.
+#
+# Current active architecture:
+# - Prediction: PX4 body-frame velocity + body angular rate
+# - Updates: ArUco x/y + z + yaw, laser z, optional UWB x/y
+# - State frame: drone pose expressed in the landpad frame
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# DEBUG CONFIGURATION
-# -----------------------------------------------------------------------------
 debug:
-  log_transforms: true       # Log transform validations at startup
-  log_innovations: true     # Log measurement innovations
-  log_covariance: true       # Log covariance diagonal every 2s
-  log_prediction: true     # Log velocity and dt in predict step
-  log_measurements: true     # Log raw sensor measurements
+  log_innovations: true
+  log_covariance: true
+  log_prediction: true
 
-# -----------------------------------------------------------------------------
-# EKF INITIALIZATION
-# -----------------------------------------------------------------------------
 initialization:
-  # Initial state covariance (diagonal values)
+  # Diagonal entries of the initial covariance matrix P.
   P_init:
-    position: [100.0, 100.0, 100.0]
-    velocity: [100.0, 100.0, 100.0]
-    orientation: [100.0, 100.0, 100.0, 100.0]
-    
-  # Wait for first ArUco detection before starting filter
-  # Set to false for testing without ArUco
-  wait_for_aruco: true  #
-  
-  # Default initialization position (used if wait_for_aruco is false)
-  default_position: [0.0, 0.0, 0.1]  # x, y, z in landpad frame
-  default_orientation: [0.0, 0.0, -0.7071068, 0.7071068]  # qx, qy, qz, qw
-  alternative_covariance_scale: 2.0  # Higher uncertainty than ArUco init
+    position: [0.05, 0.05, 0.10]       # m^2
+    velocity: [0.50, 0.50, 0.25]       # (m/s)^2
+    orientation: [0.05, 0.05, 0.05, 0.05]  # quaternion-component variance
 
-# -----------------------------------------------------------------------------
-# SENSOR ENABLE/DISABLE TOGGLES
-# -----------------------------------------------------------------------------
+  # Wait for the first ArUco pose before switching to TRACKING.
+  wait_for_aruco: true
+
+  # Used only when wait_for_aruco is false.
+  default_position: [0.0, 0.0, 0.1]               # m, landpad frame
+  default_orientation: [0.0, 0.0, -0.7071068, 0.7071068]  # quaternion [x,y,z,w]
+  alternative_covariance_scale: 2.0
+
 sensors:
   aruco:
     enabled: true
-    position_update: true
-    orientation_update: true
-    # Per-marker configuration (EKF subscribes to each individually)
+    position_update: true         # legacy parent switch for ArUco position updates
+    xy_update: true               # x/y update, independently gated
+    z_update: true                # z update, independently gated
+    orientation_update: true      # yaw-only update
+    max_age: 0.40                 # seconds; measured ArUco age is often 0.17-0.31 s
     markers:
-      417:   # 25cm - largest, most reliable
+      417:
         topic: '/aruco/pose/marker_417'
-        position_noise: [0.10, 0.10, 0.15]
-        orientation_noise_rvec: [0.10, 0.10, 0.10]
-      363:   # 15cm - medium
+        position_noise: [0.02, 0.02, 0.08]      # variance [m^2]
+        orientation_noise_yaw: 0.025            # variance [rad^2]
+      363:
         topic: '/aruco/pose/marker_363'
-        position_noise: [0.10, 0.10, 0.15]
-        orientation_noise_rvec: [0.10, 0.10, 0.10]
-      682:   # 8cm - smallest, least reliable
+        position_noise: [0.06, 0.06, 0.14]      # variance [m^2]
+        orientation_noise_yaw: 0.06             # variance [rad^2]
+      682:
         topic: '/aruco/pose/marker_682'
-        position_noise: [0.10, 0.10, 0.15]
-        orientation_noise_rvec: [0.10, 0.10, 0.10]
+        position_noise: [0.18, 0.18, 0.30]      # variance [m^2]
+        orientation_noise_yaw: 0.12             # variance [rad^2]
 
   thermal:
     enabled: false
     topic: '/thermal/pose'
     position_update: true
-    orientation_update: true   # yaw-only in EKF
+    orientation_update: true      # yaw-only update
     allow_initialization: false
-    max_age: 0.5
-    
+    max_age: 0.5                  # seconds
+
   laser:
-    enabled: true          
+    enabled: true
     topic: '/mavros/altitude'
-    field: 'bottom_clearance' # Which field to use from Altitude message
-    
+
   uwb:
-    enabled: true           
-    topic: '/dwm1001/id_D082/pose_kf'
-    
-  optical_flow: # Don't ever use it for now, its broken
-    enabled: false            
+    enabled: false
+    topic: '/dwm1001/id_uwb_map/pose_kf'
+
+  optical_flow:
+    enabled: false
     flow_topic: '/mavros/px4flow/raw/optical_flow_rad'
     range_topic: '/mavros/px4flow/ground_distance'
     min_quality: 100
-    
+
   px4_velocity:
-    enabled: true             
-    topic: '/mavros/local_position/velocity_body' 
-    use_z: false
+    enabled: true
+    topic: '/mavros/local_position/velocity_body'
+    use_z: false                  # z in the process model intentionally disabled
 
-# -----------------------------------------------------------------------------
-# ARUCO DETECTION QUALITY GATE (in stereo_aruco_detector_node)
-# -----------------------------------------------------------------------------
-# Minimum pixel span for reliable PnP. Markers appearing smaller than this
-# in the image are rejected before pose estimation. Set via Config::minPixelSpan.
-# Current: 60 pixels
-# Formula: max_range = marker_size * focal_length / min_pixel_span
-# -----------------------------------------------------------------------------
-
-# -----------------------------------------------------------------------------
-# PROCESS MODEL CONFIGURATION
-# -----------------------------------------------------------------------------
 process_model:
-  # Use PX4's fused velocity estimate (includes IMU + barometer + flow fusion)
+  # This is PX4 velocity dead reckoning, not raw IMU mechanization.
   type: 'PX4_Velocity'
-  
-  # Process noise covariance Q (diagonal values)
-  # State: [x, y, z, vx, vy, vz, qx, qy, qz, qw]
   Q:
-    position: [0.01, 0.01, 0.5]     # Z very high: model gives nothing useful
-    velocity: [0.1, 0.1, 0.5]       # Z velocity also unreliable
-    orientation: [0.01, 0.01, 0.1, 0.1] 
+    position: [0.01, 0.01, 0.001]           # variance [m^2 / s]
+    velocity: [0.20, 0.20, 0.02]            # variance [(m/s)^2 / s]
+    orientation: [0.01, 0.01, 0.01, 0.01]   # quaternion-component variance / s
 
-# -----------------------------------------------------------------------------
-# MEASUREMENT NOISE COVARIANCES (R matrices)
-# -----------------------------------------------------------------------------
+covariance_limits:
+  enabled: true
+  # Prevent long vision dropouts from making one later marker sample dominate
+  # the whole state. These are generous ceilings, not normal operating targets.
+  min_diag: 1.0e-9
+  max_diag:
+    position: [1.0, 1.0, 0.5]          # m^2
+    velocity: [1.0, 1.0, 0.5]          # (m/s)^2
+    orientation: [0.02, 0.02, 0.02, 0.02]
+
 measurement_noise:
   aruco:
-    position: [0.3, 0.3, 0.5]           # x, y, z measurement noise (reduced trust due to noise)
-    orientation_rvec: [0.2, 0.2, 0.2]   # legacy roll/pitch/yaw noise vector
-    yaw: 0.2                             # yaw-only update noise
+    # Fallback only. Configured markers use sensors.aruco.markers.* noise.
+    position: [0.08, 0.08, 0.12]   # [m^2]
+    yaw: 0.05                      # [rad^2]
 
   thermal:
-    position: [0.4, 0.4, 0.6]
-    yaw: 0.3
-    
-  laser:
-    z: [0.05]                            # z-only measurement noise (very accurate)
-    
-  uwb:
-    xy: [0.2, 0.2]                     # x, y measurement noise (trust UWB more)
-    
-  optical_flow:
-    velocity_xy: [0.1, 0.1]              # Not used (optical flow disabled)
+    position: [0.16, 0.16, 0.25]   # [m^2]
+    yaw: 0.09                      # [rad^2]
 
-# -----------------------------------------------------------------------------
-# MAHALANOBIS GATE THRESHOLDS (chi-squared values)
-# -----------------------------------------------------------------------------
-# Measurements with Mahalanobis distance² exceeding these thresholds are rejected.
-# Values come from chi-squared distribution at chosen confidence level.
-#
-# DOF  |  95%    99%     99.9%
-# -----+------------------------
-#  1   |  3.841   6.635  10.828    (laser: z only)
-#  2   |  5.991   9.210  13.816    (UWB: x,y)
-#  3   |  7.815  11.345  16.266    (ArUco: x,y,z or roll,pitch,yaw)
-#
+  laser:
+    z: [0.01]                      # [m^2]
+
+  uwb:
+    xy: [0.25, 0.25]               # [m^2]
+
+  optical_flow:
+    velocity_xy: [0.1, 0.1]        # [(m/s)^2]
+
 mahalanobis:
   aruco:
-    enabled: false
-    position_threshold: 11.345   # 3 DOF, 99% confidence
-    yaw_threshold: 6.635         # 1 DOF, 99% confidence
+    # Master switch. Optional per-component overrides are xy_enabled,
+    # z_enabled, and yaw_enabled if you want to gate only some components.
+    enabled: true
+    xy_threshold: 9.210           # chi^2, 2 DOF, 99%
+    z_threshold: 6.635            # chi^2, 1 DOF, 99%
+    yaw_threshold: 6.635          # chi^2, 1 DOF, 99%
+  laser:
+    enabled: true
+    z_threshold: 10.828           # chi^2, 1 DOF, 99.9%
   uwb:
     enabled: false
-    xy_threshold: 9.210          # 2 DOF, 99% confidence
+    xy_threshold: 9.210           # chi^2, 2 DOF, 99%
   thermal:
     enabled: false
-    position_threshold: 11.345   # 3 DOF, 99% confidence
-    yaw_threshold: 6.635         # 1 DOF, 99% confidence
+    position_threshold: 11.345
+    yaw_threshold: 6.635
 
-# Backward-compatible legacy thresholds. Negative means disabled.
-mahalanobis_gates:
-  aruco_position: -1
-  aruco_yaw: -1
-  thermal_position: -1
-  thermal_yaw: -1
-  laser: -1
-  uwb: -1
+innovation_limits:
+  aruco:
+    enabled: true
+    xy_norm: 1.0                  # m; reject impossible reacquisition jumps
+    z_abs: 0.50                   # m
+    yaw_abs: 0.60                 # rad, about 34 deg
+  laser:
+    enabled: true
+    z_abs: 0.60                   # m
 
-# -----------------------------------------------------------------------------
-# STATIC TRANSFORMS (4x4 Homogeneous Transformation Matrices)
-# -----------------------------------------------------------------------------
-# Format: Row-major 4x4 matrix [R11,R12,R13,tx, R21,R22,R23,ty, R31,R32,R33,tz, 0,0,0,1]
-# These transform FROM sensor frame TO drone body frame: T_drone_sensor
-# -----------------------------------------------------------------------------
-
+# Format: row-major 4x4 homogeneous matrix
+# [R11,R12,R13,tx, R21,R22,R23,ty, R31,R32,R33,tz, 0,0,0,1]
 transforms:
-  # Camera to Drone transform (CORRECTED: X sign flipped)
-  # Camera: X-right, Y-down, Z-forward (pointing down)
-  # Drone: X-forward, Y-left, Z-up
+  # Transform from stereo camera frame to drone body frame.
+  # Camera axes are project-specific; comments below describe the active matrix,
+  # not a generic convention:
+  #   drone_x = +camera_y
+  #   drone_y = +camera_x
+  #   drone_z = -camera_z
   T_cam_to_drone:
     matrix: [
-       0.0, 1.0,  0.0,  0.153,   #  drone_x = -cam_y
-       1.0,  0.0,  0.0, -0.030,   # ✓ drone_y = cam_x
-       0.0,  0.0, -1.0, -0.100,   # ✓ drone_z = -cam_z
-       0.0,  0.0,  0.0,  1.000
+      0.0, 1.0, 0.0, 0.153,
+      1.0, 0.0, 0.0, -0.030,
+      0.0, 0.0, -1.0, -0.100,
+      0.0, 0.0, 0.0, 1.000
     ]
 
-  # Thermal camera to Drone transform. Calibrate separately if thermal camera
-  # is not physically colocated/aligned with the stereo camera.
   T_thermal_to_drone:
     matrix: [
-       0.0, 1.0,  0.0,  0.153,
-       1.0, 0.0,  0.0, -0.030,
-       0.0, 0.0, -1.0, -0.100,
-       0.0, 0.0,  0.0,  1.000
+      0.0, 1.0, 0.0, 0.153,
+      1.0, 0.0, 0.0, -0.030,
+      0.0, 0.0, -1.0, -0.100,
+      0.0, 0.0, 0.0, 1.000
     ]
-    
-  # Laser altimeter to Drone transform
+
   T_laser_to_drone:
     matrix: [
-       1.0,  0.0,  0.0,  0.000,   
-       0.0,  -1.0,  0.0,  0.000,
-       0.0,  0.0, -1.0, -0.100,   # Mounted 10cm below drone origin
-       0.0,  0.0,  0.0,  1.000
+      1.0, 0.0, 0.0, 0.000,
+      0.0, -1.0, 0.0, 0.000,
+      0.0, 0.0, -1.0, -0.100,
+      0.0, 0.0, 0.0, 1.000
     ]
-    
-  # UWB tag to Drone transform
+
   T_uwb_to_drone:
     matrix: [
-       1.0,  0.0,  0.0,  0.035,
-       0.0,  1.0,  0.0,  0.040,
-       0.0,  0.0,  1.0,  0.000,
-       0.0,  0.0,  0.0,  1.000
+      1.0, 0.0, 0.0, 0.035,
+      0.0, 1.0, 0.0, 0.040,
+      0.0, 0.0, 1.0, 0.000,
+      0.0, 0.0, 0.0, 1.000
     ]
-    
-  # Optical Flow sensor to Drone transform (not used, but kept for completeness)
+
   T_flow_to_drone:
     matrix: [
-       1.0,  0.0,  0.0,  0.080,
-       0.0,  1.0,  0.0,  0.000,
-       0.0,  0.0,  1.0, -0.110,
-       0.0,  0.0,  0.0,  1.000
+      1.0, 0.0, 0.0, 0.080,
+      0.0, 1.0, 0.0, 0.000,
+      0.0, 0.0, 1.0, -0.110,
+      0.0, 0.0, 0.0, 1.000
     ]
 
-# -----------------------------------------------------------------------------
-# UWB TO LANDPAD FRAME TRANSFORM
-# -----------------------------------------------------------------------------
-# This transforms UWB map frame to landpad frame
-# Must be calibrated based on UWB anchor positions relative to landing pad
 T_uwb_map_to_landpad:
   matrix: [
-     1.0,  0.0,  0.0,  -0.4475,
-     0.0,  1.0,  0.0,  -0.306,
-     0.0,  0.0,  1.0,  0.000,
-     0.0,  0.0,  0.0,  1.000
+    1.0, 0.0, 0.0, -0.4475,
+    0.0, 1.0, 0.0, -0.306,
+    0.0, 0.0, 1.0, 0.000,
+    0.0, 0.0, 0.0, 1.000
   ]
 
-
-# -----------------------------------------------------------------------------
-# PUBLISHED TOPICS (for plotter consumption)
-# -----------------------------------------------------------------------------
 output_topics:
   ekf_pose: '/ekf/pose'
   ekf_odom: '/ekf/odom'
   dead_reckoning: '/ekf/dead_reckoning'
-  
-  # Per-sensor measurement topics (transformed to landpad frame)
+
   aruco_measurement: '/ekf/measurements/aruco'
   aruco_marker_measurement_prefix: '/ekf/measurements/aruco/marker_'
   thermal_measurement: '/ekf/measurements/thermal'
   laser_measurement: '/ekf/measurements/laser'
   uwb_measurement: '/ekf/measurements/uwb'
-  
-  # Sensor status topic
-  sensor_status: '/ekf/sensor_status'
 
-# -----------------------------------------------------------------------------
-# PLOTTER CONFIGURATION
-# -----------------------------------------------------------------------------
+  sensor_status: '/ekf/sensor_status'
+  innovation_debug: '/ekf/debug/innovation'
+  covariance_debug: '/ekf/debug/covariance'
+  kalman_gain_debug: '/ekf/debug/kalman_gain'
+  aruco_marker_quality: '/aruco/debug/marker_quality'
+
 plotter:
   save_dir: '/tmp/ekf_plots'
-  save_on_shutdown: true
-  max_points: 10000
+  max_points: 6000
+  max_plot_points: 1000
+  max_event_points: 1000
+  dpi: 300
+  tight_bbox: true
+  nis:
+    ylim: [0, 15]
+    sqrt_ylim: [0, 4]
   yaw:
-    show_dead_reckoning: false  
-    ylim: [-200, 200]            
-    unwrap: false             
-
+    show_dead_reckoning: false
+    ylim: [-200, 200]
+    unwrap: false
