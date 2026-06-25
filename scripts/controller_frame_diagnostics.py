@@ -149,6 +149,7 @@ class ControllerFrameDiagnostics:
         self.yaw_target = diag_cfg.get('yaw_target_rad', math.pi / 2.0)
         self.csv_path = diag_cfg.get('csv_path', '')
         self.max_age_warn = diag_cfg.get('max_age_warn', 0.5)
+        self.log_to_screen = diag_cfg.get('log_to_screen', False)
 
         topic_cfg = diag_cfg.get('topics', {})
         self.topics = {
@@ -300,7 +301,7 @@ class ControllerFrameDiagnostics:
             self.csv_writer.writerow({k: row.get(k, '') for k in self.csv_keys})
             self.csv_file.flush()
 
-        if 'ekf_pose' in data:
+        if self.log_to_screen and 'ekf_pose' in data:
             rospy.loginfo_throttle(
                 2.0,
                 '[FRAME_DIAG] pose x=%.2f y=%.2f yaw=%.1fdeg target=%.1fdeg err=%.1fdeg front=%s',

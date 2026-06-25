@@ -13,6 +13,8 @@ It intentionally avoids generating one figure per sensor.
 
 import json
 import os
+import signal
+import sys
 import time
 from collections import deque
 
@@ -156,12 +158,21 @@ class EKFPlotter:
         self.max_plot_points = plotter_cfg.get('max_plot_points', 2500)
         self.max_event_points = plotter_cfg.get('max_event_points', 3000)
         self.tight_bbox = plotter_cfg.get('tight_bbox', False)
+        self.shutdown_timeout_sec = float(plotter_cfg.get('shutdown_timeout_sec', 0.0))
+        self.detached_shutdown_save = bool(plotter_cfg.get('detached_shutdown_save', True))
+        self.shutdown_save_log = plotter_cfg.get(
+            'shutdown_save_log',
+            os.path.join(self.save_dir, 'plotter_shutdown_save.log')
+        )
 
         plt.rcParams['path.simplify'] = True
         plt.rcParams['agg.path.chunksize'] = 10000
 
         self.start_time = None
         self.shutdown_complete = False
+
+        # Make roslaunch / rospy shutdown call the same save path as Ctrl+C.
+        rospy.on_shutdown(self.save_and_exit)
 
         self.setup_subscribers()
 
@@ -515,7 +526,10 @@ class EKFPlotter:
         thermal = self.thermal_data.get_arrays()
         laser = self.laser_data.get_arrays()
         uwb = self.uwb_data.get_arrays()
-        aruco_markers = {mid: data.get_arrays() for mid, data in self.aruco_marker_data.items()}
+        aruco_markers = {
+            mid: data.get_arrays()
+            for mid, data in self.aruco_marker_data.items()
+        }
 
         if should_unwrap:
             ekf['yaw'] = self.unwrap_yaw(ekf['yaw'])
@@ -525,43 +539,83 @@ class EKFPlotter:
                 marker['yaw'] = self.unwrap_yaw(marker['yaw'])
 
         plot_count = 0
+        timeout_hit = False
+        skipped_timeout = []
+        skipped_no_data = []
+        failed_plots = []
 
-        if self.ekf_data.has_data and len(ekf['times']) > 10:
-            self.plot_combined_measurements(
+        deadline = None
+        # 0.0 means no internal plotter timeout; finish all available plots.
+        if prefix == 'final' and self.shutdown_timeout_sec > 0.0:
+            deadline = time.time() + self.shutdown_timeout_sec
+
+        def run_plot(label, should_plot, plot_fn):
+            nonlocal plot_count, timeout_hit
+
+            if not should_plot:
+                skipped_no_data.append(label)
+                return
+
+            if timeout_hit:
+                skipped_timeout.append(label)
+                return
+
+            if deadline is not None and time.time() >= deadline:
+                timeout_hit = True
+                skipped_timeout.append(label)
+                rospy.logwarn(
+                    "[PLOTTER] Shutdown save budget reached before %s; "
+                    "skipping remaining plots",
+                    label
+                )
+                return
+
+            try:
+                plot_fn()
+                plot_count += 1
+            except Exception as exc:
+                failed_plots.append((label, exc))
+                rospy.logerr("[PLOTTER] Failed while generating %s: %s", label, exc)
+
+        run_plot(
+            'combined comparison',
+            self.ekf_data.has_data and len(ekf['times']) > 10,
+            lambda: self.plot_combined_measurements(
                 ekf, dr, thermal, laser, uwb, aruco_markers, yaw_cfg, prefix
             )
-            plot_count += 1
+        )
+        run_plot('innovations', len(self.innovation_events) > 0, lambda: self.plot_innovations(prefix))
+        run_plot('NIS', len(self.innovation_events) > 0, lambda: self.plot_nis(prefix))
+        run_plot('covariance', len(self.covariance_events) > 0, lambda: self.plot_covariance(prefix))
+        run_plot('kalman gain', len(self.kalman_gain_events) > 0, lambda: self.plot_selected_gains(prefix))
+        run_plot('marker quality', len(self.marker_quality_events) > 0, lambda: self.plot_marker_quality(prefix))
+        run_plot(
+            'timing diagnostics',
+            len(self.timing_events) > 0 or len(self.innovation_events) > 0 or len(self.covariance_events) > 0,
+            lambda: self.plot_timing_diagnostics(prefix)
+        )
 
-        if len(self.innovation_events) > 0:
-            self.plot_innovations(prefix)
-            plot_count += 1
-            self.plot_nis(prefix)
-            plot_count += 1
-
-        if len(self.covariance_events) > 0:
-            self.plot_covariance(prefix)
-            plot_count += 1
-
-        if len(self.kalman_gain_events) > 0:
-            self.plot_selected_gains(prefix)
-            plot_count += 1
-
-        if len(self.marker_quality_events) > 0:
-            self.plot_marker_quality(prefix)
-            plot_count += 1
-
-        if len(self.timing_events) > 0 or len(self.innovation_events) > 0 or len(self.covariance_events) > 0:
-            self.plot_timing_diagnostics(prefix)
-            plot_count += 1
-
+        elapsed = time.time() - start_wall
         if plot_count == 0:
-            rospy.logwarn("[PLOTTER] No data available for plotting")
+            rospy.logwarn("[PLOTTER] No plots were generated")
         else:
-            elapsed = time.time() - start_wall
             rospy.loginfo(
                 f"[PLOTTER] Generated {plot_count} plot(s) in {self.save_dir} "
                 f"({elapsed:.1f} s)"
             )
+        if skipped_timeout:
+            rospy.logwarn("[PLOTTER] Skipped due to shutdown timeout: %s", ", ".join(skipped_timeout))
+        if failed_plots:
+            rospy.logerr("[PLOTTER] Failed plots: %s", ", ".join(label for label, _exc in failed_plots))
+
+        return {
+            'plot_count': plot_count,
+            'timeout_hit': timeout_hit,
+            'skipped_timeout': skipped_timeout,
+            'skipped_no_data': skipped_no_data,
+            'failed_plots': failed_plots,
+            'elapsed_sec': elapsed,
+        }
 
     def plot_combined_measurements(self, ekf, dr, thermal, laser, uwb, aruco_markers,
                                    yaw_cfg, prefix):
@@ -1250,6 +1304,104 @@ class EKFPlotter:
     # Shutdown
     # ---------------------------------------------------------------------
 
+    def start_detached_save(self):
+        """Fork a detached saver so roslaunch can exit without killing plot generation.
+
+        Older ROS/roslaunch versions do not support per-node sigint/sigterm
+        timeout attributes. If final plotting takes longer than roslaunch's
+        built-in grace period, roslaunch sends SIGTERM/SIGKILL to this node.
+        The detached child is placed in a new session and writes progress to a
+        log file, while the parent returns immediately to roslaunch.
+        """
+        log_path = self.shutdown_save_log or os.path.join(
+            self.save_dir, 'plotter_shutdown_save.log'
+        )
+        os.makedirs(os.path.dirname(log_path) or '.', exist_ok=True)
+
+        try:
+            pid = os.fork()
+        except AttributeError:
+            # os.fork is not available on non-POSIX systems. ROS deployments for
+            # this project are Linux-based, but keep a safe synchronous fallback.
+            print("[PLOTTER] Detached save unavailable on this OS; saving in-process")
+            return self.save_and_report_in_process()
+        except OSError as exc:
+            print(f"[PLOTTER] Could not fork detached saver: {exc}")
+            print("[PLOTTER] Falling back to in-process save")
+            return self.save_and_report_in_process()
+
+        if pid > 0:
+            print(f"[PLOTTER] Detached saver started with PID {pid}")
+            print(f"[PLOTTER] Saver log: {log_path}")
+            print("[PLOTTER] roslaunch may exit now; plots will continue saving in the detached process.")
+            return None
+
+        # Child process.
+        exit_code = 0
+        try:
+            try:
+                os.setsid()
+            except Exception:
+                pass
+
+            # Do not let terminal Ctrl+C or roslaunch escalation intended for
+            # the parent interrupt the saver.
+            try:
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except Exception:
+                pass
+
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                os.dup2(fd, 1)
+                os.dup2(fd, 2)
+            finally:
+                if fd > 2:
+                    os.close(fd)
+
+            print("\n" + "=" * 70, flush=True)
+            print(f"[PLOTTER CHILD] Detached save started. PID={os.getpid()}", flush=True)
+            print(f"[PLOTTER CHILD] Saving to: {self.save_dir}", flush=True)
+            print("=" * 70, flush=True)
+
+            result = self.save_all_plots('final')
+            self.print_save_result(result)
+            print("[PLOTTER CHILD] Detached save finished", flush=True)
+        except Exception:
+            exit_code = 1
+            import traceback
+            traceback.print_exc()
+        finally:
+            try:
+                plt.close('all')
+            except Exception:
+                pass
+            os._exit(exit_code)
+
+    def print_save_result(self, result):
+        if result['failed_plots']:
+            print("[PLOTTER] Some plots failed:", flush=True)
+            for label, exc in result['failed_plots']:
+                print(f"  - {label}: {exc}", flush=True)
+
+        if result['timeout_hit']:
+            print("[PLOTTER] Partial plot save: shutdown budget was reached.", flush=True)
+            if result['skipped_timeout']:
+                print("[PLOTTER] Skipped due to timeout:", flush=True)
+                for label in result['skipped_timeout']:
+                    print(f"  - {label}", flush=True)
+        else:
+            print("[PLOTTER] All available plots saved successfully!", flush=True)
+
+        print(f"[PLOTTER] Generated: {result['plot_count']} plot(s)", flush=True)
+        print(f"[PLOTTER] Location: {self.save_dir}", flush=True)
+
+    def save_and_report_in_process(self):
+        result = self.save_all_plots('final')
+        self.print_save_result(result)
+        return result
+
     def save_and_exit(self):
         if self.shutdown_complete:
             return
@@ -1277,9 +1429,10 @@ class EKFPlotter:
             return
 
         try:
-            self.save_all_plots('final')
-            print("[PLOTTER] All plots saved successfully!")
-            print(f"[PLOTTER] Location: {self.save_dir}")
+            if self.detached_shutdown_save:
+                self.start_detached_save()
+            else:
+                self.save_and_report_in_process()
         except Exception as e:
             print(f"[PLOTTER] Error saving plots: {e}")
             import traceback
@@ -1287,14 +1440,7 @@ class EKFPlotter:
 
     def run(self):
         print("[PLOTTER] Running. Press Ctrl+C to stop and save plots.")
-        rate = rospy.Rate(10)
-        try:
-            while not rospy.is_shutdown():
-                rate.sleep()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.save_and_exit()
+        rospy.spin()
 
 
 def main():
@@ -1303,8 +1449,7 @@ def main():
         plotter = EKFPlotter()
         plotter.run()
     except rospy.ROSInterruptException:
-        if plotter:
-            plotter.save_and_exit()
+        pass
     except Exception as e:
         print(f"[PLOTTER] Fatal error: {e}")
         import traceback

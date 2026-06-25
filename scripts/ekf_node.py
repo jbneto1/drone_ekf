@@ -13,6 +13,9 @@ import rospy
 import numpy as np
 import yaml
 import os
+import sys
+import time
+from collections import deque
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TwistStamped, TransformStamped, PointStamped
 from mavros_msgs.msg import Altitude
@@ -81,6 +84,18 @@ class DroneEKF:
         # Sensor status tracking
         self.sensor_status = SensorStatus()
         
+        self.shutting_down = False
+
+        # Human-facing debug dashboard state. The JSON debug topics remain the
+        # authoritative stream for plots/bags; this only keeps the terminal tidy.
+        self.setup_debug_dashboard()
+        self.dashboard_timer = rospy.Timer(
+            rospy.Duration(max(float(self.dashboard_period), 0.1)),
+            self.dashboard_timer_cb
+        )
+        
+        rospy.on_shutdown(self.on_shutdown)
+        
         # TF broadcasters
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
         self.static_tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
@@ -114,67 +129,62 @@ class DroneEKF:
         else:
             rospy.loginfo("[EKF] ArUco initialization disabled - using alternative init")
     
+    
+    def on_shutdown(self):
+        self.shutting_down = True
+    
     # Alternative initialization method
     def try_alternative_initialization(self, event=None):
         """
         Alternative initialization for testing without ArUco.
-        
+
         Uses position/orientation from config file.
-        
+
         WARNING: This assumes the drone starts at the configured pose
         relative to the landing pad. Only use for:
         - Static testing on the ground
         - Debugging the EKF prediction loop
         - Testing with other absolute position sensors (e.g., UWB)
-        
+
         For real flights, always use ArUco initialization (wait_for_aruco: true)
         """
         if self.mode == EKFState.TRACKING:
             return
-        
-        # Load from config instead of hardcoding
+
         default_position = np.array(
             self.config['initialization'].get('default_position', [0.0, 0.0, 0.1])
         )
         default_quaternion = np.array(
             self.config['initialization'].get('default_orientation', [0.0, 0.0, 0.0, 1.0])
         )
-        
-        # Validate quaternion
         default_quaternion = self.normalize_quaternion(default_quaternion)
-        
-        # Initialize state
+
         self.state[0:3] = default_position
         self.state[3:6] = np.zeros(3)
         self.state[6:10] = default_quaternion
-        
-        # Initialize dead reckoning
         self.dead_reckoning_pos = default_position.copy()
         self.dead_reckoning_quat = default_quaternion.copy()
-        
-        # Initialize covariance with higher uncertainty
+
         self.init_covariance()
         cov_scale = self.config['initialization'].get('alternative_covariance_scale', 2.0)
         self.P *= cov_scale
-        
-        # Switch to tracking
         self.mode = EKFState.TRACKING
-        
-        # Log initialization
-        rospy.loginfo("="*60)
+
+        # Force dashboard refresh after the state and mode really changed.
+        self.maybe_render_debug_dashboard(force=True)
+
+        rospy.loginfo("=" * 60)
         rospy.loginfo("[INIT] Alternative initialization complete")
         rospy.loginfo(f"[INIT] Position: [{default_position[0]:.3f}, "
                     f"{default_position[1]:.3f}, {default_position[2]:.3f}]")
         rospy.loginfo(f"[INIT] Orientation: [{default_quaternion[0]:.3f}, "
                     f"{default_quaternion[1]:.3f}, {default_quaternion[2]:.3f}, "
                     f"{default_quaternion[3]:.3f}]")
-        
-        # Convert to Euler for readability
         roll, pitch, yaw = tft.euler_from_quaternion(default_quaternion)
         rospy.loginfo(f"[INIT] Euler (deg): roll={np.degrees(roll):.1f}, "
                     f"pitch={np.degrees(pitch):.1f}, yaw={np.degrees(yaw):.1f}")
         rospy.loginfo(f"[INIT] Covariance scale: {cov_scale}x")
-        rospy.loginfo("="*60)
+        rospy.loginfo("=" * 60)
     # =========================================================================
     # CONFIGURATION LOADING
     # =========================================================================
@@ -616,6 +626,282 @@ class DroneEKF:
                 gain_payload['measurement_gain'] = float(measurement_gain)
             self.publish_json_debug(self.kalman_gain_pub, gain_payload)
 
+        self.record_update_dashboard(
+            header, sensor_name, component, innovation, accepted, mahal_sq, gate,
+            marker_id=marker_id,
+            post_fit_residual=post_fit_residual,
+            K=K,
+            measurement_gain=measurement_gain,
+            rejection_reason=rejection_reason,
+            absolute_innovation=absolute_innovation,
+            absolute_limit=absolute_limit
+        )
+
+    # =========================================================================
+    # HUMAN-FACING DEBUG DASHBOARD
+    # =========================================================================
+
+    def setup_debug_dashboard(self):
+        """Configure compact terminal output for EKF debug sessions."""
+        legacy_verbose = any(
+            bool(self.debug_config.get(key, False))
+            for key in ('log_innovations', 'log_covariance', 'log_prediction')
+        )
+        debug_enabled = bool(self.debug_config.get('enabled', False))
+        self.dashboard_enabled = bool(
+            self.debug_config.get('dashboard', debug_enabled or legacy_verbose)
+        )
+        self.dashboard_clear_screen = bool(
+            self.debug_config.get('dashboard_clear_screen', True)
+        )
+        self.dashboard_period = float(self.debug_config.get('dashboard_period', 0.5))
+        self.dashboard_recent_events = deque(
+            maxlen=int(self.debug_config.get('dashboard_recent_events', 8))
+        )
+        self.dashboard_updates = {}
+        self.dashboard_counts = {}
+        self.dashboard_last_prediction = {}
+        self.dashboard_last_render_wall = 0.0
+        
+    def dashboard_timer_cb(self, _event):
+        """Refresh the terminal dashboard periodically, even if no EKF event occurs."""
+        self.maybe_render_debug_dashboard()
+
+    def fmt_num(self, value, digits=3, unit=''):
+        if value is None:
+            return 'n/a'
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 'n/a'
+        if not np.isfinite(value):
+            return 'n/a'
+        return f"{value:.{digits}f}{unit}"
+
+    def fmt_vec(self, values, digits=3, degrees=False, max_items=None):
+        if values is None:
+            return '[n/a]'
+        arr = np.asarray(values, dtype=float).flatten()
+        if degrees:
+            arr = np.degrees(arr)
+        if max_items is not None:
+            arr = arr[:max_items]
+        return '[' + ' '.join(self.fmt_num(v, digits) for v in arr) + ']'
+
+    def gate_summary(self):
+        specs = [
+            ('aruco', 'xy', 'aruco_xy', 9.210),
+            ('aruco', 'z', 'aruco_z', 6.635),
+            ('aruco', 'yaw', 'aruco_yaw', 6.635),
+            ('laser', 'z', 'laser', 6.635),
+            ('uwb', 'xy', 'uwb', 9.210),
+            ('thermal', 'position', 'thermal_position', 11.345),
+            ('thermal', 'yaw', 'thermal_yaw', 6.635),
+        ]
+        parts = []
+        for sensor, component, legacy_key, default in specs:
+            enabled, threshold = self.gate_enabled_and_threshold(
+                sensor, component, legacy_key, default
+            )
+            if enabled:
+                parts.append(f"{sensor}:{component}<={threshold:.2f}")
+        if not parts:
+            parts.append('mahalanobis off')
+
+        abs_parts = []
+        for sensor, cfg in sorted(self.innovation_limits_cfg.items()):
+            if cfg.get('enabled', False):
+                abs_parts.append(sensor)
+        if abs_parts:
+            parts.append('absolute=' + ','.join(abs_parts))
+        return ' | '.join(parts)
+
+    def sensor_summary(self):
+        now = rospy.Time.now().to_sec()
+        timeout = self.sensor_status.timeout
+        specs = [
+            ('aruco', self.sensor_status.last_aruco_time),
+            ('laser', self.sensor_status.last_laser_time),
+            ('uwb', self.sensor_status.last_uwb_time),
+            ('thermal', self.sensor_status.last_thermal_time),
+        ]
+        parts = []
+        for name, last_time in specs:
+            enabled = bool(self.config.get('sensors', {}).get(name, {}).get('enabled', False))
+            if last_time > 0.0 and now > 0.0:
+                age = max(0.0, now - last_time)
+                active = age < timeout
+                parts.append(
+                    f"{name}:{'on' if enabled else 'off'}/"
+                    f"{'active' if active else 'stale'} {age:.2f}s"
+                )
+            else:
+                parts.append(f"{name}:{'on' if enabled else 'off'}/waiting")
+        return ' | '.join(parts)
+
+    def record_prediction_dashboard(self, header, v_body, v_landpad, omega_body):
+        if not self.dashboard_enabled:
+            return
+        self.dashboard_last_prediction = {
+            'stamp': float(header.stamp.to_sec()) if not header.stamp.is_zero() else rospy.Time.now().to_sec(),
+            'dt': float(self.dt),
+            'v_body': self.serialize_vector(v_body),
+            'v_landpad': self.serialize_vector(v_landpad),
+            'omega_body': self.serialize_vector(omega_body),
+        }
+        self.maybe_render_debug_dashboard()
+
+    def record_update_dashboard(self, header, sensor_name, component, innovation,
+                                accepted, mahal_sq, gate, marker_id=None,
+                                post_fit_residual=None, K=None,
+                                measurement_gain=None, rejection_reason=None,
+                                absolute_innovation=None, absolute_limit=None):
+        if not self.dashboard_enabled:
+            return
+        stamp = float(header.stamp.to_sec()) if not header.stamp.is_zero() else rospy.Time.now().to_sec()
+        update = {
+            'wall_time': rospy.Time.now().to_sec(),
+            'stamp': stamp,
+            'sensor': sensor_name,
+            'component': component,
+            'marker_id': marker_id,
+            'accepted': bool(accepted),
+            'innovation': self.serialize_vector(innovation),
+            'post_fit_residual': (
+                self.serialize_vector(post_fit_residual)
+                if post_fit_residual is not None else None
+            ),
+            'mahalanobis_sq': float(mahal_sq),
+            'gate_threshold': float(gate),
+            'rejection_reason': rejection_reason,
+            'absolute_innovation': (
+                float(absolute_innovation)
+                if absolute_innovation is not None else None
+            ),
+            'absolute_limit': (
+                float(absolute_limit)
+                if absolute_limit is not None else None
+            ),
+            'gain_norm': float(np.linalg.norm(K)) if K is not None else None,
+            'measurement_gain': (
+                float(measurement_gain)
+                if measurement_gain is not None else None
+            )
+        }
+        key = (sensor_name, marker_id, component)
+        self.dashboard_updates[key] = update
+        self.dashboard_recent_events.appendleft(update)
+
+        count_key = (sensor_name, component, 'ok' if accepted else 'rejected')
+        self.dashboard_counts[count_key] = self.dashboard_counts.get(count_key, 0) + 1
+        self.maybe_render_debug_dashboard(force=not accepted)
+
+    def format_update_line(self, event):
+        marker = event.get('marker_id')
+        sensor = event.get('sensor', 'unknown')
+        label = f"{sensor}:{marker}" if marker is not None else sensor
+        component = event.get('component', 'unknown')
+        accepted = bool(event.get('accepted', False))
+        status = 'OK ' if accepted else 'REJ'
+        gate = event.get('gate_threshold')
+        nis = self.fmt_num(event.get('mahalanobis_sq'), 2)
+        if gate is not None and float(gate) > 0.0:
+            nis = f"{nis}/{float(gate):.2f}"
+        else:
+            nis = f"{nis}/off"
+        degrees = component == 'yaw'
+        unit = 'deg' if degrees else 'm'
+        innovation = self.fmt_vec(event.get('innovation'), 3, degrees=degrees)
+        residual = self.fmt_vec(event.get('post_fit_residual'), 3, degrees=degrees)
+        gain = event.get('measurement_gain')
+        if gain is None:
+            gain = event.get('gain_norm')
+        gain_text = self.fmt_num(gain, 3)
+        reason = event.get('rejection_reason') or ''
+        if event.get('absolute_limit') is not None:
+            metric = event.get('absolute_innovation')
+            limit = event.get('absolute_limit')
+            if degrees:
+                metric = np.degrees(metric)
+                limit = np.degrees(limit)
+            reason = (reason + ' ' if reason else '') + (
+                f"abs={self.fmt_num(metric, 2)}/{self.fmt_num(limit, 2)}"
+            )
+        reason = f" | {reason}" if reason else ''
+        return (
+            f"{status} {label:<12} {component:<8} "
+            f"NIS {nis:<13} innov {innovation:<24} "
+            f"res {residual:<24} K {gain_text:<7} {unit}{reason}"
+        )
+
+    def counts_summary(self):
+        parts = []
+        keys = sorted(self.dashboard_counts)
+        for sensor, component, status in keys:
+            parts.append(f"{sensor}:{component}:{status}={self.dashboard_counts[(sensor, component, status)]}")
+        return ' | '.join(parts) if parts else 'no measurement updates yet'
+
+    def render_debug_dashboard(self):
+        yaw_deg = np.degrees(self.yaw_from_quaternion(self.state[6:10]))
+        p_diag = np.diag(self.P)
+        p_std = np.sqrt(np.maximum(p_diag, 0.0))
+        pred = self.dashboard_last_prediction
+        now = rospy.Time.now().to_sec()
+        wall_stamp = time.strftime('%H:%M:%S')
+
+        lines = [
+            "DRONE EKF DEBUG",
+            f"time {wall_stamp} | ros {now:.3f}s | mode {self.mode.name} | process {self.config['process_model']['type']}",
+            f"state  pos {self.fmt_vec(self.state[0:3])} m | vel {self.fmt_vec(self.state[3:6])} m/s | yaw {yaw_deg:.2f} deg | dt {self.dt:.3f}s",
+            f"cov    std_pos {self.fmt_vec(p_std[0:3])} | std_vel {self.fmt_vec(p_std[3:6])} | std_quat {self.fmt_vec(p_std[6:10], max_items=4)}",
+            f"sensor {self.sensor_summary()}",
+            f"gates  {self.gate_summary()}",
+        ]
+
+        if pred:
+            lines.append(
+                "pred   "
+                f"v_body {self.fmt_vec(pred.get('v_body'))} -> "
+                f"v_landpad {self.fmt_vec(pred.get('v_landpad'))} | "
+                f"omega {self.fmt_vec(pred.get('omega_body'))} rad/s"
+            )
+        else:
+            if self.mode == EKFState.TRACKING:
+                lines.append("pred   waiting for PX4 velocity")
+            else:
+                lines.append("pred   inactive until EKF enters TRACKING")
+
+        lines.append("updates last events")
+        if self.dashboard_recent_events:
+            for event in list(self.dashboard_recent_events)[:self.dashboard_recent_events.maxlen]:
+                lines.append("  " + self.format_update_line(event))
+        else:
+            lines.append("  waiting for measurement updates")
+        lines.append("counts " + self.counts_summary())
+        return '\n'.join(lines)
+
+    def maybe_render_debug_dashboard(self, force=False):
+        if getattr(self, 'shutting_down', False):
+            return
+
+        if not self.dashboard_enabled:
+            return
+
+        now_wall = time.time()
+        if not force and (now_wall - self.dashboard_last_render_wall) < self.dashboard_period:
+            return
+
+        self.dashboard_last_render_wall = now_wall
+
+        text = self.render_debug_dashboard()
+        try:
+            if self.dashboard_clear_screen:
+                sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+        except Exception as exc:
+            rospy.logwarn_throttle(5.0, "[EKF] Dashboard render failed: %s", exc)
+
     # =========================================================================
     # MATH HELPER FUNCTIONS
     # =========================================================================
@@ -938,6 +1224,7 @@ class DroneEKF:
                 f"v_landpad: [{v_landpad[0]:.3f}, {v_landpad[1]:.3f}, {v_landpad[2]:.3f}] | "
                 f"dt: {self.dt:.3f} | pos: [{self.state[0]:.2f}, {self.state[1]:.2f}, {self.state[2]:.2f}]")
         
+        self.record_prediction_dashboard(header, v_body, v_landpad, omega_body)
         self.publish_timing_debug(header, 'prediction', sensor='px4_velocity', dt=self.dt)
         self.publish_estimates(header, source='prediction')
     # =========================================================================
@@ -967,10 +1254,13 @@ class DroneEKF:
             self.initialize_from_aruco(pos_drone_landpad, quat_drone_landpad)
             rospy.loginfo(f"[EKF] First ArUco detected (marker {marker_id})! Switching to TRACKING mode.")
             rospy.loginfo(f"[EKF] Initial position: [{pos_drone_landpad[0]:.3f}, "
-                         f"{pos_drone_landpad[1]:.3f}, {pos_drone_landpad[2]:.3f}]")
+                        f"{pos_drone_landpad[1]:.3f}, {pos_drone_landpad[2]:.3f}]")
             yaw = np.degrees(tft.euler_from_quaternion(quat_drone_landpad)[2])
             rospy.loginfo(f"[EKF] Initial yaw: {yaw:.1f}°")
             self.mode = EKFState.TRACKING
+
+            # Force dashboard refresh immediately after initialization.
+            self.maybe_render_debug_dashboard(force=True)
             return
         
         # Kalman update with marker-specific noise
@@ -1099,6 +1389,7 @@ class DroneEKF:
                 self.initialize_from_aruco(pos_drone_landpad, quat_drone_landpad)
                 self.mode = EKFState.TRACKING
                 rospy.loginfo("[EKF] Initialized from thermal measurement")
+                self.maybe_render_debug_dashboard(force=True)
             return
 
         thermal_cfg = self.config.get('sensors', {}).get('thermal', {})

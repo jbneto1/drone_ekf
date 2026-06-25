@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- Edit config/ekf_params.yaml plotter/output_topics sections before replay. -->
-    <rosparam command="load" file="$(find drone_ekf)/config/ekf_params.yaml" subst_value="true"/>
-
-    <node name="ekf_plotter" pkg="drone_ekf" type="plotter.py" output="screen">
+    <node name="ekf_plotter"
+          pkg="drone_ekf"
+          type="plotter.py"
+          output="screen">
         <param name="config_file" value="$(find drone_ekf)/config/ekf_params.yaml"/>
     </node>
 </launch>

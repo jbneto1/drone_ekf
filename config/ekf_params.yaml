@@ -8,17 +8,28 @@
 # =============================================================================
 
 debug:
-  log_innovations: true
-  log_covariance: true
-  log_prediction: true
+  # One compact terminal view for flight/replay debugging. The individual JSON
+  # debug topics below are still published for plotter and rosbag analysis.
+  enabled: true
+  dashboard: true
+  dashboard_clear_screen: true
+  dashboard_period: 0.5
+  dashboard_recent_events: 8
+
+  # Legacy line-by-line logs. Keep these off by default so the dashboard does
+  # not scroll away; enable temporarily only when you need raw ROS log lines.
+  log_innovations: false
+  log_covariance: false
+  log_prediction: false
 
 # Loaded by ekf.launch before nodes start. Keep runtime launch choices here so
 # normal replay/testing can be driven by editing this file only.
-/use_sim_time: false
+/use_sim_time: true
 /controller_pose_topic: '/ekf/pose'
 
 controller_frame_diagnostics:
   enabled: true
+  log_to_screen: false
   rate_hz: 10.0
   yaw_target_rad: 1.57079632679
   csv_path: ''
@@ -231,10 +242,13 @@ output_topics:
 plotter:
   save_dir: '/tmp/ekf_plots'
   max_points: 6000
-  max_plot_points: 1000
-  max_event_points: 1000
-  dpi: 300
-  tight_bbox: true
+  max_plot_points: 800
+  max_event_points: 800
+  dpi: 160
+  tight_bbox: false
+  shutdown_timeout_sec: 0.0
+  detached_shutdown_save: true
+  shutdown_save_log: '/tmp/ekf_plots/plotter_shutdown_save.log'
   nis:
     ylim: [0, 15]
     sqrt_ylim: [0, 4]
