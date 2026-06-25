@@ -1,7 +1,6 @@
 T1
-roslaunch drone_ekf ekf.launch \
-  use_sim_time:=true \
-  enable_frame_diagnostics:=false
+# For rosbag replay, set /use_sim_time: true in config/ekf_params.yaml.
+roslaunch drone_ekf ekf.launch
 
 
 T2
@@ -10,7 +9,7 @@ roslaunch iris_land aruco_stereo.launch
 
 T3 
 
-rosrun drone_ekf plotter.py _config_file:=/home/berger/catkin_ws/src/drone_ekf/config/ekf_params.yaml
+roslaunch drone_ekf plotter.launch
 
 T4 
 
@@ -31,7 +30,6 @@ rosbag record -O optionA_v9_outputs.bag \
 /ekf/pose \
 /ekf/odom \
 /ekf/dead_reckoning \
-/ekf/measurements/aruco \
 /ekf/measurements/aruco/marker_363 \
 /ekf/measurements/aruco/marker_417 \
 /ekf/measurements/aruco/marker_682 \

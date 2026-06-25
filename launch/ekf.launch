@@ -1,33 +1,17 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- EKF Sensor Fusion Launch File - package: drone_ekf -->
-
-    <arg name="use_sim_time" default="false"/>
-    <param name="/use_sim_time" value="$(arg use_sim_time)"/>
-
-    <arg name="config_file" default="$(find drone_ekf)/config/ekf_params.yaml"/>
-    <arg name="enable_rviz" default="false"/>
-    <arg name="enable_frame_diagnostics" default="false"/>
-    <arg name="controller_pose_topic" default="/ekf/pose"/>
-    <arg name="diagnostics_csv_path" default=""/>
-
-    <!-- Keep this global so iris_land's manager_control, which uses a global NodeHandle,
-         defaults to the EKF output even when launched separately. -->
-    <param name="/controller_pose_topic" value="$(arg controller_pose_topic)"/>
+    <!--
+        Main EKF launch.
+        Edit config/ekf_params.yaml for runtime choices such as /use_sim_time,
+        controller topic defaults, diagnostics settings, and EKF parameters.
+    -->
+    <rosparam command="load" file="$(find drone_ekf)/config/ekf_params.yaml" subst_value="true"/>
 
     <node name="drone_ekf" pkg="drone_ekf" type="ekf_node.py" output="screen">
-        <param name="config_file" value="$(arg config_file)"/>
+        <param name="config_file" value="$(find drone_ekf)/config/ekf_params.yaml"/>
     </node>
 
-    <!-- Passive diagnostics node for flight-test bags. It does not command the drone. -->
-    <node name="controller_frame_diagnostics" pkg="drone_ekf" type="controller_frame_diagnostics.py" output="screen"
-          if="$(arg enable_frame_diagnostics)">
-        <param name="controller_pose_topic" value="$(arg controller_pose_topic)"/>
-        <param name="yaw_target_rad" value="1.57079632679"/>
-        <param name="csv_path" value="$(arg diagnostics_csv_path)"/>
+    <node name="controller_frame_diagnostics" pkg="drone_ekf" type="controller_frame_diagnostics.py" output="screen">
+        <param name="config_file" value="$(find drone_ekf)/config/ekf_params.yaml"/>
     </node>
-
-    <node name="rviz" pkg="rviz" type="rviz"
-          args="-d $(find drone_ekf)/config/drone_pose.rviz"
-          if="$(arg enable_rviz)"/>
 </launch>

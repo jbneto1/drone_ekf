@@ -11,8 +11,8 @@ on shutdown. It is intentionally narrower than plotter.py:
 4. XY landing view
 5. Detrended dead reckoning
 
-Thermal is intentionally omitted for now. ArUco markers, combined ArUco, UWB,
-and laser are supported when their topics are present.
+Thermal is intentionally omitted for now. ArUco markers, UWB, and laser are
+supported when their topics are present.
 """
 
 import json
@@ -190,16 +190,12 @@ class EKFTuningPlotterLive:
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.max_quiver_arrows = int(rospy.get_param('~max_quiver_arrows', 45))
-        self.include_combined_aruco = bool(rospy.get_param('~include_combined_aruco', True))
         self.include_laser = bool(rospy.get_param('~include_laser', True))
 
     def setup_measurement_series(self):
         sensors = self.config.get('sensors', {})
         marker_cfg = sensors.get('aruco', {}).get('markers', {})
         marker_ids = sorted(int(mid) for mid in marker_cfg.keys()) if marker_cfg else [363, 417, 682]
-
-        if self.include_combined_aruco:
-            self.measurements['aruco_combined'] = Series('ArUco combined')
 
         for marker_id in marker_ids:
             self.measurements[f'aruco_{marker_id}'] = Series(f'ArUco ID {marker_id}')
@@ -220,20 +216,12 @@ class EKFTuningPlotterLive:
             PoseStamped, self.dead_reckoning_cb, queue_size=100
         )
 
-        if 'aruco_combined' in self.measurements:
-            rospy.Subscriber(
-                topics.get('aruco_measurement', '/ekf/measurements/aruco'),
-                PoseStamped,
-                lambda msg: self.pose_measurement_cb('aruco_combined', msg),
-                queue_size=100
-            )
-
         marker_prefix = topics.get(
             'aruco_marker_measurement_prefix',
-            topics.get('aruco_measurement', '/ekf/measurements/aruco') + '/marker_'
+            '/ekf/measurements/aruco/marker_'
         )
         for key in list(self.measurements.keys()):
-            if not key.startswith('aruco_') or key == 'aruco_combined':
+            if not key.startswith('aruco_'):
                 continue
             marker_id = key.split('_', 1)[1]
             rospy.Subscriber(
@@ -268,7 +256,10 @@ class EKFTuningPlotterLive:
                          lambda msg: self.twist_cb('velocity_body', msg), queue_size=100)
 
     def rel_time(self, stamp):
-        t = stamp.to_sec()
+        if stamp.is_zero():
+            t = rospy.Time.now().to_sec()
+        else:
+            t = stamp.to_sec()
         if self.start_time is None:
             self.start_time = t
         return t - self.start_time
@@ -544,9 +535,7 @@ class EKFTuningPlotterLive:
         styles = {}
         marker_idx = 0
         for source in self.measurements:
-            if source == 'aruco_combined':
-                styles[source] = {'color': 'tab:red', 'marker': 'o', 'alpha': 0.45, 's': 26}
-            elif source.startswith('aruco_'):
+            if source.startswith('aruco_'):
                 styles[source] = {
                     'color': colors[marker_idx % len(colors)],
                     'marker': 'o',

@@ -12,6 +12,30 @@ debug:
   log_covariance: true
   log_prediction: true
 
+# Loaded by ekf.launch before nodes start. Keep runtime launch choices here so
+# normal replay/testing can be driven by editing this file only.
+/use_sim_time: false
+/controller_pose_topic: '/ekf/pose'
+
+controller_frame_diagnostics:
+  enabled: true
+  rate_hz: 10.0
+  yaw_target_rad: 1.57079632679
+  csv_path: ''
+  max_age_warn: 0.5
+  topics:
+    ekf_pose: '/ekf/pose'
+    ekf_odom: '/ekf/odom'
+    # Empty by default to avoid recording a duplicate /ekf/pose stream.
+    # Set this to the controller's consumed pose topic when it differs.
+    controller_pose: ''
+    # Aggregate ArUco pose output was removed; use per-marker EKF plots instead.
+    raw_aruco_pose: ''
+    thermal_pose: '/thermal/pose'
+    local_pose: '/mavros/local_position/pose'
+    raw_controller_cmd: '/controller/raw_cmd_vel'
+    mavros_cmd: '/mavros/setpoint_velocity/cmd_vel'
+
 initialization:
   # Diagonal entries of the initial covariance matrix P.
   P_init:
@@ -64,12 +88,7 @@ sensors:
   uwb:
     enabled: false
     topic: '/dwm1001/id_uwb_map/pose_kf'
-
-  optical_flow:
-    enabled: false
-    flow_topic: '/mavros/px4flow/raw/optical_flow_rad'
-    range_topic: '/mavros/px4flow/ground_distance'
-    min_quality: 100
+    max_age: 0.5                  # seconds; reject stale UWB pose updates
 
   px4_velocity:
     enabled: true
@@ -94,6 +113,12 @@ covariance_limits:
     velocity: [1.0, 1.0, 0.5]          # (m/s)^2
     orientation: [0.02, 0.02, 0.02, 0.02]
 
+output:
+  # Use current ROS time for fused outputs so /ekf/odom and dead reckoning
+  # remain monotonic even when delayed measurements trigger an update.
+  # Set to 'measurement' to stamp outputs with the triggering sensor header.
+  stamp_mode: 'current'
+
 measurement_noise:
   aruco:
     # Fallback only. Configured markers use sensors.aruco.markers.* noise.
@@ -109,9 +134,6 @@ measurement_noise:
 
   uwb:
     xy: [0.2, 0.2]               # [m^2]
-
-  optical_flow:
-    velocity_xy: [0.1, 0.1]        # [(m/s)^2]
 
 mahalanobis:
   aruco:
@@ -183,14 +205,6 @@ transforms:
       0.0, 0.0, 0.0, 1.000
     ]
 
-  T_flow_to_drone:
-    matrix: [
-      1.0, 0.0, 0.0, 0.080,
-      0.0, 1.0, 0.0, 0.000,
-      0.0, 0.0, 1.0, -0.110,
-      0.0, 0.0, 0.0, 1.000
-    ]
-
 T_uwb_map_to_landpad:
   matrix: [
     1.0, 0.0, 0.0, -0.4475,
@@ -204,7 +218,6 @@ output_topics:
   ekf_odom: '/ekf/odom'
   dead_reckoning: '/ekf/dead_reckoning'
 
-  aruco_measurement: '/ekf/measurements/aruco'
   aruco_marker_measurement_prefix: '/ekf/measurements/aruco/marker_'
   thermal_measurement: '/ekf/measurements/thermal'
   laser_measurement: '/ekf/measurements/laser'
@@ -214,6 +227,7 @@ output_topics:
   innovation_debug: '/ekf/debug/innovation'
   covariance_debug: '/ekf/debug/covariance'
   kalman_gain_debug: '/ekf/debug/kalman_gain'
+  timing_debug: '/ekf/debug/timing'
   aruco_marker_quality: '/aruco/debug/marker_quality'
 
 plotter:
@@ -226,6 +240,9 @@ plotter:
   nis:
     ylim: [0, 15]
     sqrt_ylim: [0, 4]
+  covariance:
+    mode: 'std'                   # std or variance
+    yscale: 'log'                 # log or linear
   yaw:
     show_dead_reckoning: false
     ylim: [-200, 200]

@@ -68,7 +68,7 @@ rosrun drone_ekf plotter.py
    ```
    [INFO] EKF Node initialized!
    [INFO] Subscribing to: /mavros/local_position/odom
-   [INFO] Subscribing to: /aruco/pose
+   [INFO] Subscribing to: /aruco/pose/marker_417
    [INFO] Publishing to: /ekf/pose and /ekf/odom
    ```
 
