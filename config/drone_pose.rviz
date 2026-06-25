@@ -100,7 +100,7 @@ Visualization Manager:
       Shaft Length: 1
       Shaft Radius: 0.05000000074505806
       Shape: Arrow
-      Topic: /ekf/measurements/aruco
+      Topic: /ekf/measurements/aruco/marker_417
       Unreliable: false
       Value: true
     - Alpha: 1

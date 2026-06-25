@@ -15,8 +15,7 @@ import yaml
 import os
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TwistStamped, TransformStamped, PointStamped
-from mavros_msgs.msg import Altitude, OpticalFlowRad
-from sensor_msgs.msg import Range
+from mavros_msgs.msg import Altitude
 from std_msgs.msg import String
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 import tf.transformations as tft
@@ -37,12 +36,10 @@ class SensorStatus:
         self.laser_active = False
         self.uwb_active = False
         self.thermal_active = False
-        self.optical_flow_active = False
         self.last_aruco_time = 0.0
         self.last_laser_time = 0.0
         self.last_uwb_time = 0.0
         self.last_thermal_time = 0.0
-        self.last_flow_time = 0.0
         self.timeout = 2.0  # seconds
 
 
@@ -80,10 +77,6 @@ class DroneEKF:
         # Velocity storage
         self.last_body_velocity = np.zeros(3)
         self.last_angular_velocity = np.zeros(3)
-        
-        # Optical flow specific
-        self.last_flow_time = None
-        self.last_ground_distance = 1.0
         
         # Sensor status tracking
         self.sensor_status = SensorStatus()
@@ -226,7 +219,7 @@ class DroneEKF:
         
         transform_keys = [
             'T_cam_to_drone', 'T_laser_to_drone',
-            'T_uwb_to_drone', 'T_flow_to_drone'
+            'T_uwb_to_drone'
         ]
         if 'T_thermal_to_drone' in self.config.get('transforms', {}):
             transform_keys.append('T_thermal_to_drone')
@@ -270,7 +263,6 @@ class DroneEKF:
         self.R_aruco_pos = np.diag(aruco_noise_cfg['position'])
         self.R_laser = np.diag(self.config['measurement_noise']['laser']['z'])
         self.R_uwb = np.diag(self.config['measurement_noise']['uwb']['xy'])
-        self.R_flow = np.diag(self.config['measurement_noise']['optical_flow']['velocity_xy'])
 
         # Yaw-only vision update variance in rad^2.
         default_aruco_yaw_var = aruco_noise_cfg['yaw']
@@ -360,17 +352,11 @@ class DroneEKF:
                 TwistStamped, self.px4_velocity_callback, queue_size=1
             )
             rospy.loginfo(f"[EKF] Subscribed to PX4 velocity: {sensors['px4_velocity']['topic']}")
-            
-        elif process_type == 'Optical_Flow' and sensors['optical_flow']['enabled']:
-            rospy.Subscriber(
-                sensors['optical_flow']['flow_topic'],
-                OpticalFlowRad, self.optical_flow_callback, queue_size=1
+        else:
+            rospy.logwarn(
+                f"[EKF] Unsupported or disabled process model '{process_type}'. "
+                "Configure process_model.type='PX4_Velocity' and enable sensors.px4_velocity."
             )
-            rospy.Subscriber(
-                sensors['optical_flow']['range_topic'],
-                Range, self.flow_range_callback, queue_size=1
-            )
-            rospy.loginfo(f"[EKF] Subscribed to Optical Flow: {sensors['optical_flow']['flow_topic']}")
         
         # Per-marker ArUco subscribers
         if sensors['aruco']['enabled']:
@@ -416,9 +402,8 @@ class DroneEKF:
         self.dead_reckoning_pub = rospy.Publisher(topics['dead_reckoning'], PoseStamped, queue_size=1)
         
         # Per-sensor measurement publishers (transformed to landpad frame)
-        self.aruco_meas_pub = rospy.Publisher(topics['aruco_measurement'], PoseStamped, queue_size=1)
         self.aruco_marker_meas_pubs = {}
-        aruco_prefix = topics.get('aruco_marker_measurement_prefix', topics['aruco_measurement'] + '/marker_')
+        aruco_prefix = topics.get('aruco_marker_measurement_prefix', '/ekf/measurements/aruco/marker_')
         for marker_id_str in self.config.get('sensors', {}).get('aruco', {}).get('markers', {}):
             mid = int(marker_id_str)
             self.aruco_marker_meas_pubs[mid] = rospy.Publisher(
@@ -446,6 +431,10 @@ class DroneEKF:
         )
         self.kalman_gain_pub = rospy.Publisher(
             topics.get('kalman_gain_debug', '/ekf/debug/kalman_gain'),
+            String, queue_size=200
+        )
+        self.timing_pub = rospy.Publisher(
+            topics.get('timing_debug', '/ekf/debug/timing'),
             String, queue_size=200
         )
     
@@ -552,6 +541,26 @@ class DroneEKF:
         }
         self.publish_json_debug(self.covariance_pub, payload)
 
+    def publish_timing_debug(self, header, stage, sensor=None, component=None,
+                             marker_id=None, accepted=None, dt=None):
+        """Publish timestamp/age diagnostics for EKF data-flow analysis."""
+        stamp = float(header.stamp.to_sec()) if not header.stamp.is_zero() else rospy.Time.now().to_sec()
+        now = rospy.Time.now().to_sec()
+        payload = {
+            'stamp': stamp,
+            'process_stamp': now,
+            'age_sec': now - stamp,
+            'stage': stage,
+            'sensor': sensor,
+            'component': component,
+            'marker_id': int(marker_id) if marker_id is not None else None,
+        }
+        if accepted is not None:
+            payload['accepted'] = bool(accepted)
+        if dt is not None:
+            payload['dt'] = float(dt)
+        self.publish_json_debug(self.timing_pub, payload)
+
     def publish_update_debug(self, header, sensor_name, component, innovation, S, R,
                              accepted, mahal_sq, gate, K=None, marker_id=None,
                              post_fit_residual=None, measurement_gain=None,
@@ -585,6 +594,13 @@ class DroneEKF:
             )
         }
         self.publish_json_debug(self.innovation_pub, innovation_payload)
+        self.publish_timing_debug(
+            header, 'measurement_update',
+            sensor=sensor_name,
+            component=component,
+            marker_id=marker_id,
+            accepted=accepted
+        )
 
         if K is not None:
             gain_payload = {
@@ -864,122 +880,6 @@ class DroneEKF:
         self.predict_step(msg.header)
 
     # =========================================================================
-    # PROCESS MODEL: OPTICAL FLOW
-    # =========================================================================
-    
-    def flow_range_callback(self, msg):
-        """Update ground distance from range sensor."""
-        if msg.range > msg.min_range and msg.range < msg.max_range:
-            self.last_ground_distance = msg.range
-    
-    def optical_flow_callback(self, msg):
-        """Process optical flow data for velocity estimation."""
-        current_time = msg.header.stamp.to_sec()
-        
-        # Check quality threshold
-        min_quality = self.config['sensors']['optical_flow']['min_quality']
-        if msg.quality < min_quality:
-            return
-        
-        # Calculate dt
-        if self.last_flow_time is not None:
-            self.dt = np.clip(current_time - self.last_flow_time, 0.001, 0.5)
-        self.last_flow_time = current_time
-        
-        # Convert optical flow to velocity
-        integration_time = msg.integration_time_us * 1e-6
-        
-        if integration_time > 0:
-            # Flow sensor velocity (body frame)
-            flow_vx = (msg.integrated_x / integration_time) * self.last_ground_distance
-            flow_vy = (msg.integrated_y / integration_time) * self.last_ground_distance
-            
-            # Compensate for body rotation (gyro data in flow message)
-            gyro_comp_x = msg.integrated_xgyro / integration_time * self.last_ground_distance
-            gyro_comp_y = msg.integrated_ygyro / integration_time * self.last_ground_distance
-            
-            flow_vx -= gyro_comp_x
-            flow_vy -= gyro_comp_y
-            
-            # Transform from flow sensor frame to drone body frame
-            T_flow = self.transforms['T_flow_to_drone']
-            R_flow = T_flow[:3, :3]
-            
-            v_flow_sensor = np.array([flow_vx, flow_vy, 0.0])
-            v_body = R_flow @ v_flow_sensor
-            
-            # Store for process model
-            self.last_body_velocity = v_body
-            
-            # Angular velocity from flow gyro
-            self.last_angular_velocity = np.array([
-                msg.integrated_xgyro / integration_time,
-                msg.integrated_ygyro / integration_time,
-                msg.integrated_zgyro / integration_time
-            ])
-        
-        self.sensor_status.last_flow_time = current_time
-        
-        # Only proceed if tracking
-        if self.mode != EKFState.TRACKING:
-            return
-        
-        # STEP 1: Prediction using flow velocity
-        self.predict_step(msg.header)
-        
-        # STEP 2: Measurement update to correct velocity estimate
-        if integration_time > 0:
-            self.update_optical_flow_velocity(v_body, msg.header)
-
-
-    def update_optical_flow_velocity(self, z_velocity_body, header):
-        """
-        EKF Measurement Update using optical flow velocity.
-        
-        Corrects the velocity state [vx, vy, vz] in the EKF using flow measurements.
-        This is different from prediction - here we're treating flow as a measurement
-        to correct our velocity estimate.
-        """
-        # Transform measured velocity to landpad frame
-        R_drone = self.quaternion_to_rotation_matrix(self.state[6:10])
-        z_velocity_landpad = R_drone @ z_velocity_body
-        
-        # Measurement matrix: we measure vx and vy in landpad frame
-        # State is [x, y, z, vx, vy, vz, qx, qy, qz, qw]
-        #           [0, 1, 2,  3,  4,  5,  6,  7,  8,  9]
-        H = np.zeros((2, 10))
-        H[0, 3] = 1.0  # Measures vx (index 3)
-        H[1, 4] = 1.0  # Measures vy (index 4)
-        
-        # Innovation (measurement - prediction)
-        z = z_velocity_landpad[:2]  # Only vx, vy (optical flow doesn't measure vz)
-        y = z - H @ self.state
-        
-        # Innovation covariance
-        S = H @ self.P @ H.T + self.R_flow
-        
-        # Kalman gain
-        K = self.P @ H.T @ np.linalg.inv(S)
-        
-        # State update
-        self.state = self.state + (K @ y).flatten()
-        
-        # Covariance update (Joseph form for numerical stability)
-        I_KH = np.eye(10) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ self.R_flow @ K.T
-        self.stabilize_covariance()
-        
-        # Normalize quaternion (in case numerical errors accumulated)
-        self.normalize_state_quaternion()
-        
-        # Publish updated estimates
-        self.publish_estimates(header)
-    
-    def predict_step_from_flow(self, header):
-        """Prediction step using optical flow velocity."""
-        self.predict_step(header)
-
-    # =========================================================================
     # EKF PREDICTION STEP
     # =========================================================================
     
@@ -1038,7 +938,8 @@ class DroneEKF:
                 f"v_landpad: [{v_landpad[0]:.3f}, {v_landpad[1]:.3f}, {v_landpad[2]:.3f}] | "
                 f"dt: {self.dt:.3f} | pos: [{self.state[0]:.2f}, {self.state[1]:.2f}, {self.state[2]:.2f}]")
         
-        self.publish_estimates(header)
+        self.publish_timing_debug(header, 'prediction', sensor='px4_velocity', dt=self.dt)
+        self.publish_estimates(header, source='prediction')
     # =========================================================================
     # MEASUREMENT UPDATE: ARUCO
     # =========================================================================
@@ -1542,15 +1443,31 @@ class DroneEKF:
         """Measurement update from UWB (x, y only)."""
         if self.mode != EKFState.TRACKING:
             return
-        
-        # Update sensor status
-        self.sensor_status.last_uwb_time = rospy.Time.now().to_sec()
+
+        if self.is_stale(msg.header, 'uwb'):
+            rospy.logwarn_throttle(2.0, "[UWB] Dropping stale measurement")
+            return
+
+        uwb_quat = np.array([
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+            msg.pose.orientation.w
+        ])
+        uwb_pos_msg = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z
+        ])
+        if not self.finite_pose(uwb_pos_msg, uwb_quat):
+            rospy.logwarn_throttle(2.0, "[UWB] Dropping invalid measurement")
+            return
         
         # UWB position in UWB map frame
         uwb_pos_map = np.array([
-            msg.pose.position.x,
-            msg.pose.position.y,
-            msg.pose.position.z,
+            uwb_pos_msg[0],
+            uwb_pos_msg[1],
+            uwb_pos_msg[2],
             1.0
         ])
         
@@ -1565,6 +1482,12 @@ class DroneEKF:
         # Drone position = UWB position - offset (rotated by drone orientation)
         R_drone = self.quaternion_to_rotation_matrix(self.state[6:10])
         drone_pos_landpad = uwb_pos_landpad[:3] - R_drone @ uwb_offset
+        if not np.all(np.isfinite(drone_pos_landpad)):
+            rospy.logwarn_throttle(2.0, "[UWB] Dropping invalid transformed measurement")
+            return
+
+        # Update sensor status after stale/finite gates pass.
+        self.sensor_status.last_uwb_time = rospy.Time.now().to_sec()
         
         # Publish measurement
         self.publish_uwb_measurement(msg.header, drone_pos_landpad[:2])
@@ -1614,9 +1537,21 @@ class DroneEKF:
     # PUBLISHERS
     # =========================================================================
     
-    def publish_estimates(self, header):
-        """Publish EKF estimate, dead reckoning, and TF."""
-        stamp = header.stamp
+    def publish_estimates(self, header, source='measurement'):
+        """Publish EKF estimate and diagnostics.
+
+        Dead reckoning is prediction-only because it only advances in
+        predict_step(). Measurement updates change the fused EKF state but not
+        the dead-reckoning state, so republishing it there creates misleading
+        repeated samples in plots.
+        """
+        stamp_mode = self.config.get('output', {}).get('stamp_mode', 'current')
+        if stamp_mode == 'measurement' and not header.stamp.is_zero():
+            stamp = header.stamp
+        else:
+            stamp = rospy.Time.now()
+            if stamp.is_zero() and not header.stamp.is_zero():
+                stamp = header.stamp
         if not np.all(np.isfinite(self.state[0:6])):
             rospy.logwarn_throttle(
                 1.0,
@@ -1625,8 +1560,6 @@ class DroneEKF:
             return
         state_quat = self.normalize_quaternion(self.state[6:10])
         self.state[6:10] = state_quat
-        dead_reckoning_quat = self.normalize_quaternion(self.dead_reckoning_quat)
-        self.dead_reckoning_quat = dead_reckoning_quat
         
         # === EKF Pose ===
         pose_msg = PoseStamped()
@@ -1655,18 +1588,21 @@ class DroneEKF:
             odom_msg.pose.covariance[i*7] = self.P[i, i]
         self.ekf_odom_pub.publish(odom_msg)
         
-        # === Dead Reckoning ===
-        dr_msg = PoseStamped()
-        dr_msg.header.stamp = stamp
-        dr_msg.header.frame_id = "landpad"
-        dr_msg.pose.position.x = self.dead_reckoning_pos[0]
-        dr_msg.pose.position.y = self.dead_reckoning_pos[1]
-        dr_msg.pose.position.z = self.dead_reckoning_pos[2]
-        dr_msg.pose.orientation.x = dead_reckoning_quat[0]
-        dr_msg.pose.orientation.y = dead_reckoning_quat[1]
-        dr_msg.pose.orientation.z = dead_reckoning_quat[2]
-        dr_msg.pose.orientation.w = dead_reckoning_quat[3]
-        self.dead_reckoning_pub.publish(dr_msg)
+        if source == 'prediction':
+            # === Dead Reckoning ===
+            dead_reckoning_quat = self.normalize_quaternion(self.dead_reckoning_quat)
+            self.dead_reckoning_quat = dead_reckoning_quat
+            dr_msg = PoseStamped()
+            dr_msg.header.stamp = stamp
+            dr_msg.header.frame_id = "landpad"
+            dr_msg.pose.position.x = self.dead_reckoning_pos[0]
+            dr_msg.pose.position.y = self.dead_reckoning_pos[1]
+            dr_msg.pose.position.z = self.dead_reckoning_pos[2]
+            dr_msg.pose.orientation.x = dead_reckoning_quat[0]
+            dr_msg.pose.orientation.y = dead_reckoning_quat[1]
+            dr_msg.pose.orientation.z = dead_reckoning_quat[2]
+            dr_msg.pose.orientation.w = dead_reckoning_quat[3]
+            self.dead_reckoning_pub.publish(dr_msg)
         
         # === TF ===
         t = TransformStamped()
@@ -1681,7 +1617,7 @@ class DroneEKF:
         t.transform.rotation.z = state_quat[2]
         t.transform.rotation.w = state_quat[3]
         self.tf_broadcaster.sendTransform(t)
-        self.publish_covariance_debug(header, 'publish_estimate')
+        self.publish_covariance_debug(odom_msg.header, 'publish_estimate')
         
         if self.debug_config['log_covariance']:
             rospy.loginfo_throttle(2.0, 
@@ -1689,7 +1625,7 @@ class DroneEKF:
                 f"Vel: {np.diag(self.P[3:6,3:6])}, "
                 f"Ori: {np.diag(self.P[6:10,6:10])}")
 
-        self.publish_diagnostics(header)
+        self.publish_diagnostics(odom_msg.header)
     
     def publish_aruco_measurement(self, header, position, quaternion, marker_id=None):
         """Publish transformed ArUco measurement."""
@@ -1704,7 +1640,6 @@ class DroneEKF:
         msg.pose.orientation.y = quaternion[1]
         msg.pose.orientation.z = quaternion[2]
         msg.pose.orientation.w = quaternion[3]
-        self.aruco_meas_pub.publish(msg)
         if marker_id in getattr(self, 'aruco_marker_meas_pubs', {}):
             self.aruco_marker_meas_pubs[marker_id].publish(msg)
 

@@ -46,7 +46,7 @@ rostopic hz /ekf/pose
 rosmsg show geometry_msgs/PoseStamped
 
 # View one message
-rostopic echo -n 1 /aruco/pose
+rostopic echo -n 1 /aruco/pose/marker_417
 ```
 
 ### 4. Subscribers
@@ -81,7 +81,7 @@ def odom_callback(self, msg):
 ### Data Flow
 ```
 Rosbag → /mavros/local_position/odom → EKF Node → /ekf/pose → Plotter
-         /aruco/pose ---------------↗
+         /aruco/pose/marker_* ------↗
 ```
 
 ### Step-by-Step
@@ -139,10 +139,10 @@ rosrun drone_ekf plotter.py
 rostopic list
 
 # What's the message type?
-rostopic info /aruco/pose
+rostopic info /aruco/pose/marker_417
 
 # What's in the message?
-rostopic echo /aruco/pose
+rostopic echo /aruco/pose/marker_417
 
 # How fast are messages coming?
 rostopic hz /ekf/pose

@@ -17,6 +17,7 @@ import os
 from collections import OrderedDict
 
 import rospy
+import yaml
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
@@ -137,40 +138,39 @@ class ControllerFrameDiagnostics:
     def __init__(self):
         rospy.init_node('controller_frame_diagnostics', anonymous=False)
 
-        self.rate_hz = rospy.get_param('~rate_hz', 10.0)
-        self.yaw_target = rospy.get_param('~yaw_target_rad', math.pi / 2.0)
-        self.csv_path = rospy.get_param('~csv_path', '')
-        self.max_age_warn = rospy.get_param('~max_age_warn', 0.5)
+        config = self.load_config()
+        diag_cfg = config.get('controller_frame_diagnostics', {})
+        if not diag_cfg.get('enabled', True):
+            rospy.loginfo('[FRAME_DIAG] Disabled by controller_frame_diagnostics.enabled')
+            rospy.signal_shutdown('disabled by config')
+            return
 
+        self.rate_hz = diag_cfg.get('rate_hz', 10.0)
+        self.yaw_target = diag_cfg.get('yaw_target_rad', math.pi / 2.0)
+        self.csv_path = diag_cfg.get('csv_path', '')
+        self.max_age_warn = diag_cfg.get('max_age_warn', 0.5)
+
+        topic_cfg = diag_cfg.get('topics', {})
         self.topics = {
-            'ekf_pose': rospy.get_param('~ekf_pose_topic', '/ekf/pose'),
-            'ekf_odom': rospy.get_param('~ekf_odom_topic', '/ekf/odom'),
-            'controller_pose': rospy.get_param('~controller_pose_topic', '/ekf/pose'),
-            'raw_aruco_pose': rospy.get_param('~raw_aruco_pose_topic', '/aruco/pose'),
-            'thermal_pose': rospy.get_param('~thermal_pose_topic', '/thermal/pose'),
-            'local_pose': rospy.get_param('~local_pose_topic', '/mavros/local_position/pose'),
-            'raw_controller_cmd': rospy.get_param('~raw_controller_cmd_topic', '/controller/raw_cmd_vel'),
-            'mavros_cmd': rospy.get_param('~mavros_cmd_topic', '/mavros/setpoint_velocity/cmd_vel'),
+            'ekf_pose': topic_cfg.get('ekf_pose', '/ekf/pose'),
+            'ekf_odom': topic_cfg.get('ekf_odom', '/ekf/odom'),
+            'controller_pose': topic_cfg.get('controller_pose', ''),
+            'thermal_pose': topic_cfg.get('thermal_pose', '/thermal/pose'),
+            'local_pose': topic_cfg.get('local_pose', '/mavros/local_position/pose'),
+            'raw_controller_cmd': topic_cfg.get('raw_controller_cmd', '/controller/raw_cmd_vel'),
+            'mavros_cmd': topic_cfg.get('mavros_cmd', '/mavros/setpoint_velocity/cmd_vel'),
         }
 
         self.last = {name: LastMsg() for name in self.topics}
+        self.subscribers = []
 
-        rospy.Subscriber(self.topics['ekf_pose'], PoseStamped,
-                         lambda msg: self.last['ekf_pose'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['ekf_odom'], Odometry,
-                         lambda msg: self.last['ekf_odom'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['controller_pose'], PoseStamped,
-                         lambda msg: self.last['controller_pose'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['raw_aruco_pose'], PoseStamped,
-                         lambda msg: self.last['raw_aruco_pose'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['thermal_pose'], PoseStamped,
-                         lambda msg: self.last['thermal_pose'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['local_pose'], PoseStamped,
-                         lambda msg: self.last['local_pose'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['raw_controller_cmd'], TwistStamped,
-                         lambda msg: self.last['raw_controller_cmd'].update(msg), queue_size=10)
-        rospy.Subscriber(self.topics['mavros_cmd'], TwistStamped,
-                         lambda msg: self.last['mavros_cmd'].update(msg), queue_size=10)
+        self.subscribe('ekf_pose', PoseStamped)
+        self.subscribe('ekf_odom', Odometry)
+        self.subscribe('controller_pose', PoseStamped)
+        self.subscribe('thermal_pose', PoseStamped)
+        self.subscribe('local_pose', PoseStamped)
+        self.subscribe('raw_controller_cmd', TwistStamped)
+        self.subscribe('mavros_cmd', TwistStamped)
 
         self.pub = rospy.Publisher('/controller/frame_diagnostics', String, queue_size=10)
 
@@ -178,7 +178,9 @@ class ControllerFrameDiagnostics:
         self.csv_writer = None
         self.csv_keys = None
         if self.csv_path:
-            os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+            csv_dir = os.path.dirname(self.csv_path)
+            if csv_dir:
+                os.makedirs(csv_dir, exist_ok=True)
             self.csv_file = open(self.csv_path, 'w', newline='')
 
         rospy.Timer(rospy.Duration(1.0 / max(self.rate_hz, 1e-3)), self.publish)
@@ -187,6 +189,36 @@ class ControllerFrameDiagnostics:
         rospy.loginfo('[FRAME_DIAG] Running. Publishing /controller/frame_diagnostics')
         rospy.loginfo('[FRAME_DIAG] Yaw target: %.3f rad / %.1f deg',
                       self.yaw_target, math.degrees(self.yaw_target))
+
+    def load_config(self):
+        config_path = rospy.get_param('~config_file', '')
+        if not config_path:
+            package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_path = os.path.join(package_dir, 'config', 'ekf_params.yaml')
+
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+            rospy.loginfo('[FRAME_DIAG] Loaded config from: %s', config_path)
+            return config
+        except Exception as exc:
+            rospy.logerr('[FRAME_DIAG] Failed to load config %s: %s', config_path, exc)
+            rospy.signal_shutdown('configuration load failed')
+            return {}
+
+    def subscribe(self, name, msg_type):
+        topic = self.topics.get(name, '')
+        if not topic:
+            rospy.loginfo('[FRAME_DIAG] Topic %s disabled in config', name)
+            return
+        self.subscribers.append(
+            rospy.Subscriber(
+                topic,
+                msg_type,
+                lambda msg, key=name: self.last[key].update(msg),
+                queue_size=10
+            )
+        )
 
     def close(self):
         if self.csv_file:
@@ -220,7 +252,7 @@ class ControllerFrameDiagnostics:
         else:
             data['ekf_odom_pose'] = empty_pose_dict()
 
-        for name in ['controller_pose', 'raw_aruco_pose', 'thermal_pose', 'local_pose']:
+        for name in ['controller_pose', 'thermal_pose', 'local_pose']:
             if self.last[name].msg is not None:
                 data[name] = pose_to_dict(self.last[name].msg)
             else:

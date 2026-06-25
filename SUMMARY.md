@@ -62,7 +62,7 @@ x = [x, y, z, vx, vy, vz]ᵀ
 └──────────┬────────────────────┬─────────────────┘
            │                    │
            ▼                    ▼
-    /mavros/local_           /aruco/pose
+    /mavros/local_           /aruco/pose/marker_*
     position/odom         (ArUco measurements)
     (odometry)
            │                    │
@@ -173,7 +173,7 @@ The plotter shows 6 graphs:
 ### 1. Check topics are publishing
 ```bash
 rostopic hz /mavros/local_position/odom   # Should show ~50-100 Hz
-rostopic hz /aruco/pose                   # Varies (ArUco detection rate)
+rostopic hz /aruco/pose/marker_417        # Varies (ArUco detection rate)
 rostopic hz /ekf/pose                     # Should match odom rate
 ```
 
@@ -195,7 +195,7 @@ rviz
 ### Step 1: Process Model Only
 ```python
 # In ekf_node.py, comment out ArUco subscriber (line 40-41)
-# rospy.Subscriber('/aruco/pose', PoseStamped, 
+# rospy.Subscriber('/aruco/pose/marker_417', PoseStamped, 
 #                 self.aruco_callback, queue_size=1)
 ```
 - EKF should track odometry closely
@@ -205,7 +205,7 @@ rviz
 ### Step 2: Add Measurements
 ```python
 # Uncomment ArUco subscriber
-rospy.Subscriber('/aruco/pose', PoseStamped, 
+rospy.Subscriber('/aruco/pose/marker_417', PoseStamped, 
                 self.aruco_callback, queue_size=1)
 ```
 - Green dots appear when ArUco detected

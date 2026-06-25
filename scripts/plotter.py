@@ -60,13 +60,18 @@ class SensorData:
         self.has_data = True
 
     def get_arrays(self):
-        return {
+        arrays = {
             'times': np.array(list(self.times)),
             'x': np.array([v if v is not None else np.nan for v in self.x]),
             'y': np.array([v if v is not None else np.nan for v in self.y]),
             'z': np.array([v if v is not None else np.nan for v in self.z]),
             'yaw': np.array([v if v is not None else np.nan for v in self.yaw]),
         }
+        if len(arrays['times']) > 1:
+            order = np.argsort(arrays['times'], kind='mergesort')
+            for key in arrays:
+                arrays[key] = arrays[key][order]
+        return arrays
 
 
 class EventBuffer:
@@ -82,7 +87,7 @@ class EventBuffer:
         return len(self.events)
 
     def list(self):
-        return list(self.events)
+        return sorted(self.events, key=lambda event: event.get('t', 0.0))
 
 
 class EKFPlotter:
@@ -96,7 +101,6 @@ class EKFPlotter:
 
         self.ekf_data = SensorData(max_pts)
         self.dr_data = SensorData(max_pts)
-        self.aruco_data = SensorData(max_pts)
         self.thermal_data = SensorData(max_pts)
         self.laser_data = SensorData(max_pts)
         self.uwb_data = SensorData(max_pts)
@@ -109,6 +113,7 @@ class EKFPlotter:
         self.covariance_events = EventBuffer(max_pts)
         self.kalman_gain_events = EventBuffer(max_pts)
         self.marker_quality_events = EventBuffer(max_pts)
+        self.timing_events = EventBuffer(max_pts)
 
         self.sensor_config = {
             'aruco': {'enabled': False, 'active': False},
@@ -194,10 +199,6 @@ class EKFPlotter:
         )
 
         rospy.Subscriber(
-            topics.get('aruco_measurement', '/ekf/measurements/aruco'),
-            PoseStamped, self.aruco_callback, queue_size=1
-        )
-        rospy.Subscriber(
             topics.get('thermal_measurement', '/ekf/measurements/thermal'),
             PoseStamped, self.thermal_callback, queue_size=1
         )
@@ -216,7 +217,7 @@ class EKFPlotter:
 
         aruco_prefix = topics.get(
             'aruco_marker_measurement_prefix',
-            topics.get('aruco_measurement', '/ekf/measurements/aruco') + '/marker_'
+            '/ekf/measurements/aruco/marker_'
         )
         for marker_id in sorted(self.aruco_marker_data.keys()):
             rospy.Subscriber(
@@ -242,6 +243,10 @@ class EKFPlotter:
             topics.get('aruco_marker_quality', '/aruco/debug/marker_quality'),
             String, self.marker_quality_callback, queue_size=100
         )
+        rospy.Subscriber(
+            topics.get('timing_debug', '/ekf/debug/timing'),
+            String, self.timing_callback, queue_size=200
+        )
 
     def relative_time_from_sec(self, stamp_sec):
         if self.start_time is None:
@@ -249,6 +254,8 @@ class EKFPlotter:
         return stamp_sec - self.start_time
 
     def get_time(self, stamp):
+        if stamp.is_zero():
+            return self.relative_time_from_sec(rospy.Time.now().to_sec())
         return self.relative_time_from_sec(stamp.to_sec())
 
     def parse_debug_event(self, msg):
@@ -256,8 +263,16 @@ class EKFPlotter:
             event = json.loads(msg.data)
         except json.JSONDecodeError:
             return None
-        stamp_sec = float(event.get('stamp', rospy.Time.now().to_sec()))
+        receive_stamp_sec = rospy.Time.now().to_sec()
+        try:
+            stamp_sec = float(event.get('stamp', receive_stamp_sec))
+        except (TypeError, ValueError):
+            stamp_sec = receive_stamp_sec
+        if not np.isfinite(stamp_sec) or stamp_sec <= 0.0:
+            stamp_sec = receive_stamp_sec
         event['t'] = self.relative_time_from_sec(stamp_sec)
+        event['receive_t'] = self.relative_time_from_sec(receive_stamp_sec)
+        event['plotter_latency_sec'] = receive_stamp_sec - stamp_sec
         return event
 
     # ---------------------------------------------------------------------
@@ -273,11 +288,6 @@ class EKFPlotter:
         if self.shutdown_complete:
             return
         self.dr_data.add_pose(self.get_time(msg.header.stamp), msg.pose)
-
-    def aruco_callback(self, msg):
-        if self.shutdown_complete:
-            return
-        self.aruco_data.add_pose(self.get_time(msg.header.stamp), msg.pose)
 
     def thermal_callback(self, msg):
         if self.shutdown_complete:
@@ -336,6 +346,13 @@ class EKFPlotter:
         event = self.parse_debug_event(msg)
         if event is not None:
             self.marker_quality_events.add(event)
+
+    def timing_callback(self, msg):
+        if self.shutdown_complete:
+            return
+        event = self.parse_debug_event(msg)
+        if event is not None:
+            self.timing_events.add(event)
 
     # ---------------------------------------------------------------------
     # Plot helpers
@@ -495,7 +512,6 @@ class EKFPlotter:
 
         ekf = self.ekf_data.get_arrays()
         dr = self.dr_data.get_arrays()
-        aruco = self.aruco_data.get_arrays()
         thermal = self.thermal_data.get_arrays()
         laser = self.laser_data.get_arrays()
         uwb = self.uwb_data.get_arrays()
@@ -504,7 +520,6 @@ class EKFPlotter:
         if should_unwrap:
             ekf['yaw'] = self.unwrap_yaw(ekf['yaw'])
             dr['yaw'] = self.unwrap_yaw(dr['yaw'])
-            aruco['yaw'] = self.unwrap_yaw(aruco['yaw'])
             thermal['yaw'] = self.unwrap_yaw(thermal['yaw'])
             for marker in aruco_markers.values():
                 marker['yaw'] = self.unwrap_yaw(marker['yaw'])
@@ -513,7 +528,7 @@ class EKFPlotter:
 
         if self.ekf_data.has_data and len(ekf['times']) > 10:
             self.plot_combined_measurements(
-                ekf, dr, aruco, thermal, laser, uwb, aruco_markers, yaw_cfg, prefix
+                ekf, dr, thermal, laser, uwb, aruco_markers, yaw_cfg, prefix
             )
             plot_count += 1
 
@@ -535,6 +550,10 @@ class EKFPlotter:
             self.plot_marker_quality(prefix)
             plot_count += 1
 
+        if len(self.timing_events) > 0 or len(self.innovation_events) > 0 or len(self.covariance_events) > 0:
+            self.plot_timing_diagnostics(prefix)
+            plot_count += 1
+
         if plot_count == 0:
             rospy.logwarn("[PLOTTER] No data available for plotting")
         else:
@@ -544,7 +563,7 @@ class EKFPlotter:
                 f"({elapsed:.1f} s)"
             )
 
-    def plot_combined_measurements(self, ekf, dr, aruco, thermal, laser, uwb, aruco_markers,
+    def plot_combined_measurements(self, ekf, dr, thermal, laser, uwb, aruco_markers,
                                    yaw_cfg, prefix):
         fig, axes = plt.subplots(4, 1, figsize=(16, 14), sharex=True)
         fig.suptitle(
@@ -858,6 +877,169 @@ class EKFPlotter:
         filepath = os.path.join(self.save_dir, f'nis_{prefix}.png')
         self.save_figure(fig, filepath)
 
+    def plot_timing_diagnostics(self, prefix):
+        timing_events = self.thin_events(self.timing_events.list())
+        if not timing_events:
+            timing_events = []
+            for event in self.innovation_events.list():
+                if event.get('age_sec') is None:
+                    continue
+                timing_events.append({
+                    't': event['t'],
+                    'stage': 'measurement_update',
+                    'sensor': event.get('sensor', 'unknown'),
+                    'component': event.get('component', 'unknown'),
+                    'accepted': event.get('accepted', True),
+                    'age_sec': event.get('age_sec'),
+                })
+            for event in self.covariance_events.list():
+                timing_events.append({
+                    't': event['t'],
+                    'stage': event.get('source', 'covariance'),
+                    'sensor': 'ekf',
+                    'component': 'covariance',
+                    'age_sec': event.get('plotter_latency_sec'),
+                })
+            timing_events = sorted(timing_events, key=lambda event: event.get('t', 0.0))
+            timing_events = self.thin_events(timing_events)
+        if not timing_events:
+            return
+
+        fig, axes = plt.subplots(5, 1, figsize=(16, 17))
+        fig.suptitle('EKF Timing Diagnostics', fontsize=14, fontweight='bold')
+
+        def event_name(event):
+            stage = event.get('stage', 'unknown')
+            sensor = event.get('sensor')
+            component = event.get('component')
+            if stage == 'prediction':
+                return 'prediction'
+            if sensor and component:
+                return f'{sensor}:{component}'
+            return sensor or stage
+
+        names = sorted({event_name(event) for event in timing_events})
+        name_to_y = {name: idx for idx, name in enumerate(names)}
+        cmap = plt.get_cmap('tab10')
+        color_map = {name: cmap(idx % 10) for idx, name in enumerate(names)}
+
+        grouped_times = {}
+        for event in timing_events:
+            name = event_name(event)
+            grouped_times.setdefault(name, []).append(event['t'])
+
+            age = event.get('age_sec')
+            if age is not None:
+                try:
+                    age = float(age)
+                except (TypeError, ValueError):
+                    age = None
+            if age is not None and np.isfinite(age):
+                axes[0].scatter(
+                    event['t'], age,
+                    c=[color_map[name]], s=22,
+                    marker='o' if event.get('accepted', True) else 'x',
+                    alpha=0.8,
+                    label=name if name not in axes[0].get_legend_handles_labels()[1] else None
+                )
+
+            axes[3].scatter(
+                event['t'], name_to_y[name],
+                c=[color_map[name]], s=20,
+                marker='o' if event.get('accepted', True) else 'x',
+                alpha=0.75
+            )
+
+        axes[0].set_ylabel('Processing age (s)', fontsize=11)
+        axes[0].set_title('Message stamp age when EKF processed the event', fontsize=11)
+        axes[0].grid(True, alpha=0.3)
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            axes[0].legend(handles, labels, loc='upper right', fontsize=8, ncol=3)
+
+        for name, times in grouped_times.items():
+            times = np.array(sorted(t for t in times if np.isfinite(t)), dtype=float)
+            if len(times) <= 1:
+                continue
+            dt = np.diff(times)
+            axes[1].scatter(
+                times[1:], dt,
+                c=[color_map[name]], s=18, alpha=0.7,
+                label=name
+            )
+        axes[1].set_ylabel('Event dt (s)', fontsize=11)
+        axes[1].set_title('Spacing between consecutive events of each source', fontsize=11)
+        axes[1].grid(True, alpha=0.3)
+        handles, labels = axes[1].get_legend_handles_labels()
+        if handles:
+            axes[1].legend(handles, labels, loc='upper right', fontsize=8, ncol=3)
+
+        prediction_events = [
+            event for event in timing_events
+            if event.get('stage') == 'prediction' and event.get('dt') is not None
+        ]
+        if prediction_events:
+            times = []
+            dts = []
+            for event in prediction_events:
+                try:
+                    dt = float(event.get('dt'))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(dt):
+                    times.append(event['t'])
+                    dts.append(dt)
+            axes[2].plot(times, dts, color='tab:blue', linewidth=1.4, label='prediction dt')
+            axes[2].legend(loc='upper right', fontsize=8)
+        else:
+            axes[2].annotate(
+                'No prediction dt samples on /ekf/debug/timing',
+                xy=(0.5, 0.5), xycoords='axes fraction',
+                ha='center', va='center', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
+            )
+        axes[2].set_ylabel('Prediction dt (s)', fontsize=11)
+        axes[2].set_title('Prediction integration dt', fontsize=11)
+        axes[2].grid(True, alpha=0.3)
+
+        axes[3].set_yticks(list(name_to_y.values()))
+        axes[3].set_yticklabels(list(name_to_y.keys()), fontsize=8)
+        axes[3].set_ylabel('Event source', fontsize=11)
+        axes[3].set_title('EKF event raster by stamp time', fontsize=11)
+        axes[3].grid(True, axis='x', alpha=0.3)
+
+        ages_by_name = {}
+        for event in timing_events:
+            age = event.get('age_sec')
+            if age is None:
+                continue
+            try:
+                age = float(age)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(age):
+                ages_by_name.setdefault(event_name(event), []).append(age)
+        for name, ages in ages_by_name.items():
+            axes[4].hist(
+                ages, bins=40, histtype='step',
+                linewidth=1.2, color=color_map[name],
+                label=name
+            )
+        axes[4].set_xlabel('Processing age (s)', fontsize=11)
+        axes[4].set_ylabel('Count', fontsize=11)
+        axes[4].set_title('Distribution of processing age', fontsize=11)
+        axes[4].grid(True, alpha=0.3)
+        handles, labels = axes[4].get_legend_handles_labels()
+        if handles:
+            axes[4].legend(handles, labels, loc='upper right', fontsize=8, ncol=3)
+
+        for ax in axes[:4]:
+            ax.set_xlabel('Time (s)', fontsize=11)
+
+        plt.tight_layout()
+        filepath = os.path.join(self.save_dir, f'timing_diagnostics_{prefix}.png')
+        self.save_figure(fig, filepath)
+
     def plot_marker_quality(self, prefix):
         configured_markers = set(self.aruco_marker_data.keys())
         events = [
@@ -967,20 +1149,40 @@ class EKFPlotter:
             rospy.logwarn("[PLOTTER] Covariance debug topic missing expected 10-state diagonal")
             return
 
+        cov_cfg = self.config.get('plotter', {}).get('covariance', {})
+        mode = cov_cfg.get('mode', 'std')
+        yscale = cov_cfg.get('yscale', 'log')
+        if mode == 'variance':
+            plot_values = p_diag.copy()
+            value_label = 'Variance'
+            title_suffix = 'variance'
+        else:
+            plot_values = np.sqrt(np.maximum(p_diag, 0.0))
+            value_label = 'Std dev'
+            title_suffix = 'standard deviation'
+
+        if yscale == 'log':
+            plot_values[plot_values <= 0.0] = np.nan
+
         fig, axes = plt.subplots(3, 1, figsize=(16, 12), sharex=True)
-        fig.suptitle('EKF Covariance Diagonal P', fontsize=14, fontweight='bold')
+        fig.suptitle(
+            f'EKF Covariance Diagonal P ({title_suffix})',
+            fontsize=14, fontweight='bold'
+        )
 
         groups = [
-            ('Position covariance', [0, 1, 2], ['Pxx', 'Pyy', 'Pzz']),
-            ('Velocity covariance', [3, 4, 5], ['Pvx', 'Pvy', 'Pvz']),
-            ('Quaternion covariance', [6, 7, 8, 9], ['Pqx', 'Pqy', 'Pqz', 'Pqw']),
+            ('Position uncertainty', [0, 1, 2], ['x', 'y', 'z']),
+            ('Velocity uncertainty', [3, 4, 5], ['vx', 'vy', 'vz']),
+            ('Quaternion uncertainty', [6, 7, 8, 9], ['qx', 'qy', 'qz', 'qw']),
         ]
         colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
 
         for ax, (title, indices, labels) in zip(axes, groups):
             for idx, label, color in zip(indices, labels, colors):
-                ax.plot(times, p_diag[:, idx], linewidth=1.5, label=label, color=color)
-            ax.set_ylabel('Variance', fontsize=11)
+                ax.plot(times, plot_values[:, idx], linewidth=1.5, label=label, color=color)
+            if yscale == 'log':
+                ax.set_yscale('log')
+            ax.set_ylabel(value_label, fontsize=11)
             ax.set_title(title, fontsize=11)
             ax.grid(True, alpha=0.3)
             ax.legend(loc='upper right', fontsize=9, ncol=2)
@@ -1057,7 +1259,20 @@ class EKFPlotter:
         print("[PLOTTER] Shutting down, saving plots...")
         print("=" * 50)
 
-        if not self.ekf_data.has_data and len(self.innovation_events) == 0:
+        has_any_data = (
+            self.ekf_data.has_data or
+            self.dr_data.has_data or
+            self.thermal_data.has_data or
+            self.laser_data.has_data or
+            self.uwb_data.has_data or
+            any(data.has_data for data in self.aruco_marker_data.values()) or
+            len(self.innovation_events) > 0 or
+            len(self.covariance_events) > 0 or
+            len(self.kalman_gain_events) > 0 or
+            len(self.marker_quality_events) > 0 or
+            len(self.timing_events) > 0
+        )
+        if not has_any_data:
             print("[PLOTTER] No data collected, nothing to save")
             return
 
