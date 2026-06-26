@@ -112,16 +112,6 @@ process_model:
     velocity: [10, 10, 10]            # variance [(m/s)^2 / s]
     orientation: [10, 10, 10, 10]   # quaternion-component variance / s
 
-covariance_limits:
-  enabled: false
-  # Prevent long vision dropouts from making one later marker sample dominate
-  # the whole state. These are generous ceilings, not normal operating targets.
-  min_diag: 1.0e-9
-  max_diag:
-    position: [1.0, 1.0, 0.5]          # m^2
-    velocity: [1.0, 1.0, 0.5]          # (m/s)^2
-    orientation: [0.02, 0.02, 0.02, 0.02]
-
 output:
   # Use current ROS time for fused outputs so /ekf/odom and dead reckoning
   # remain monotonic even when delayed measurements trigger an update.
@@ -162,16 +152,6 @@ mahalanobis:
     enabled: false
     position_threshold: 11.345
     yaw_threshold: 6.635
-
-innovation_limits:
-  aruco:
-    enabled: false
-    xy_norm: 1.0                  # m; reject impossible reacquisition jumps
-    z_abs: 0.50                   # m
-    yaw_abs: 0.60                 # rad, about 34 deg
-  laser:
-    enabled: false
-    z_abs: 0.60                   # m
 
 # Format: row-major 4x4 homogeneous matrix
 # [R11,R12,R13,tx, R21,R22,R23,ty, R31,R32,R33,tz, 0,0,0,1]

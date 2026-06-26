@@ -424,6 +424,41 @@ class EKFPlotter:
             self.legend_marker('black', rejected_label, marker='x', markersize=7),
         ]
 
+    def time_key(self, t):
+        return round(float(t), 6)
+
+    def aruco_update_status_lookup(self):
+        component_axes = {
+            'position': ('x', 'y', 'z'),
+            'xy': ('x', 'y'),
+            'z': ('z',),
+            'yaw': ('yaw',),
+        }
+        lookup = {}
+        for event in self.innovation_events.list():
+            if event.get('sensor') != 'aruco':
+                continue
+            marker_id = event.get('marker_id')
+            if marker_id is None:
+                continue
+            axes = component_axes.get(event.get('component'))
+            if axes is None:
+                continue
+
+            accepted = bool(event.get('accepted', True))
+            key = self.time_key(event.get('t', 0.0))
+            for axis_key in axes:
+                lookup[(int(marker_id), axis_key, key)] = accepted
+        return lookup
+
+    def aruco_update_acceptance(self, lookup, marker_id, axis_key, times):
+        accepted = np.ones(len(times), dtype=bool)
+        for idx, t in enumerate(times):
+            status = lookup.get((int(marker_id), axis_key, self.time_key(t)))
+            if status is not None:
+                accepted[idx] = status
+        return accepted
+
     def save_figure(self, fig, filepath):
         if self.tight_bbox:
             fig.savefig(filepath, dpi=self.plot_dpi, bbox_inches='tight')
@@ -647,6 +682,8 @@ class EKFPlotter:
 
         all_handles = []
         all_labels = []
+        aruco_update_lookup = self.aruco_update_status_lookup()
+        plotted_rejected_aruco = False
 
         for ax_idx, (label, key) in enumerate(components):
             ax = axes[ax_idx]
@@ -689,14 +726,28 @@ class EKFPlotter:
                 if np.any(valid):
                     label_text = f'ArUco {marker_id}'
                     color = self.marker_colors.get(marker_id, 'black')
-                    t_plot, v_plot = self.thin_series(marker_data['times'][valid], marker_data[key][valid])
-                    scatter = ax.scatter(
-                        t_plot, v_plot,
-                        c=color, s=30, marker='o', alpha=0.75,
-                        label=label_text, edgecolors=color, linewidths=0.4, zorder=4
+                    times = marker_data['times'][valid]
+                    values = marker_data[key][valid]
+                    accepted_mask = self.aruco_update_acceptance(
+                        aruco_update_lookup, marker_id, key, times
                     )
+                    for accepted, marker_style, size, alpha, linewidth in (
+                        (True, 'o', 30, 0.75, 0.4),
+                        (False, 'x', 36, 0.95, 0.9),
+                    ):
+                        status_mask = accepted_mask if accepted else ~accepted_mask
+                        if not np.any(status_mask):
+                            continue
+                        t_plot, v_plot = self.thin_series(times[status_mask], values[status_mask])
+                        ax.scatter(
+                            t_plot, v_plot,
+                            c=color, s=size, marker=marker_style, alpha=alpha,
+                            edgecolors=color, linewidths=linewidth, zorder=4
+                        )
+                        if not accepted:
+                            plotted_rejected_aruco = True
                     if label_text not in all_labels:
-                        all_handles.append(scatter)
+                        all_handles.append(self.legend_marker(color, label_text, marker='o'))
                         all_labels.append(label_text)
 
             for sensor_name, sensor_data in (
@@ -730,7 +781,20 @@ class EKFPlotter:
                 ax.set_ylim(yaw_cfg['ylim'][0], yaw_cfg['ylim'][1])
 
         if all_handles:
-            axes[0].legend(all_handles, all_labels, loc='upper right', fontsize=9, ncol=2)
+            legend_title = None
+            if plotted_rejected_aruco:
+                status_handles = self.status_legend_handles(
+                    'Accepted ArUco update',
+                    'Rejected ArUco update'
+                )
+                all_handles.extend(status_handles)
+                all_labels.extend([handle.get_label() for handle in status_handles])
+                legend_title = 'Color: source/marker | Symbol: ArUco update status'
+            axes[0].legend(
+                all_handles, all_labels,
+                loc='upper right', fontsize=9, ncol=2,
+                title=legend_title
+            )
 
         process_model = self.sensor_config.get('process_model', 'Unknown')
         axes[0].annotate(
