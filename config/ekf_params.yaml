@@ -222,9 +222,9 @@ output_topics:
 plotter:
   save_dir: '/tmp/ekf_plots'
   max_points: 6000
-  max_plot_points: 800
-  max_event_points: 800
-  dpi: 160
+  max_plot_points: 1600
+  max_event_points: 1600
+  dpi: 300
   tight_bbox: false
   shutdown_timeout_sec: 0.0
   detached_shutdown_save: true
@@ -233,7 +233,7 @@ plotter:
     ylim: [0, 15]
     sqrt_ylim: [0, 4]
   covariance:
-    mode: 'std'                   # std or variance
+    mode: 'variance'                   # std or variance
     yscale: 'log'                 # log or linear
   yaw:
     show_dead_reckoning: false

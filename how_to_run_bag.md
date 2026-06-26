@@ -52,26 +52,9 @@ rosbag record -O optionA_v9_outputs.bag \
 /tf_static
 
 
-T7
-cd ~/JOAO_MARROM
-
-rosbag play --clock --pause 19_06_26.bag --topics \
-/stereo/left/image_raw \
-/stereo/right/image_raw \
-/mavros/local_position/velocity_body \
-/mavros/local_position/pose \
-/mavros/altitude \
-/tf \
-/tf_static
-
-
-T8
-
-rosbag play --clock --pause bag_stereo_20_03_26.bag --topics \
-/stereo/left/image_raw \
-/stereo/right/image_raw \
-/mavros/local_position/velocity_body \
-/mavros/local_position/pose \
-/mavros/altitude \
-/tf \
-/tf_static
+rosbag play --clock 3m.bag --topics \
+  /mavros/local_position/velocity_body \
+  /mavros/altitude \
+  /stereo/left/image_raw \
+  /stereo/right/image_raw \
+  /tf /tf_static
