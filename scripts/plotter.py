@@ -1319,15 +1319,11 @@ class EKFPlotter:
                 continue
             callback_stamp = finite_value(detector_event, 'callback_start_stamp')
             publish_stamp = finite_value(camera_event, 'publish_complete_stamp')
-<<<<<<< HEAD
             detector_mode = detector_event.get('pose_estimation_mode', 'stereo')
             if (
                 detector_mode == 'stereo' and
                 callback_stamp is not None and publish_stamp is not None
             ):
-=======
-            if callback_stamp is not None and publish_stamp is not None:
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
                 image_ros_points.append(
                     (detector_event['t'], (callback_stamp - publish_stamp) * 1000.0)
                 )
@@ -1385,7 +1381,6 @@ class EKFPlotter:
             'ArUco End-to-End Latency and Bottleneck Profile',
             fontsize=14, fontweight='bold'
         )
-<<<<<<< HEAD
         stereo_detector_events = [
             event for event in detector_events
             if event.get('pose_estimation_mode', 'stereo') == 'stereo'
@@ -1394,8 +1389,6 @@ class EKFPlotter:
             event for event in detector_events
             if event.get('pose_estimation_mode') == 'monocular'
         ]
-=======
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
 
         # Cross-process boundaries. The two ROS-overhead lines subtract the
         # producer's publish-complete time from the consumer callback start.
@@ -1426,11 +1419,7 @@ class EKFPlotter:
                     label=label, linewidth=0.9, alpha=0.8
                 )
         plot_metric(
-<<<<<<< HEAD
             axes[0], stereo_detector_events, 'sync_dispatch_ms',
-=======
-            axes[0], detector_events, 'sync_dispatch_ms',
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
             'Stereo sync dispatch'
         )
         if pose_ros_points:
@@ -1446,30 +1435,16 @@ class EKFPlotter:
         axes[0].legend(loc='upper right', fontsize=8, ncol=3)
 
         detector_metrics = [
-<<<<<<< HEAD
             ('cv_bridge_ms', 'cv_bridge conversion/share'),
             ('grayscale_ms', 'Grayscale'),
             ('rectify_ms', 'Undistort/rectify'),
             ('visualization_prepare_ms', 'Visualization prep'),
             ('detect_left_ms', 'Detect left'),
             ('pixel_gate_ms', 'Pixel gate'),
-=======
-            ('cv_bridge_ms', 'cv_bridge copies'),
-            ('grayscale_ms', 'Grayscale'),
-            ('rectify_ms', 'Stereo rectify'),
-            ('visualization_prepare_ms', 'Visualization prep'),
-            ('detect_left_ms', 'Detect left'),
-            ('detect_right_ms', 'Detect right'),
-            ('stereo_match_ms', 'Stereo match'),
-            ('pixel_gate_ms', 'Pixel gate'),
-            ('raw_pose_ms', 'Raw PnP'),
-            ('stereo_pnp_ms', 'Stereo PnP'),
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
             ('result_and_pose_publish_ms', 'Transform/result/publish'),
         ]
         for key, label in detector_metrics:
             plot_metric(axes[1], detector_events, key, label)
-<<<<<<< HEAD
         for key, label in (
             ('detect_right_ms', 'Detect right'),
             ('stereo_match_ms', 'Stereo match'),
@@ -1479,10 +1454,8 @@ class EKFPlotter:
             plot_metric(axes[1], stereo_detector_events, key, label)
         plot_metric(
             axes[1], monocular_detector_events, 'stereo_pnp_ms',
-            'ArUco IPPE square pose'
+            'ArUco single-marker pose'
         )
-=======
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
         axes[1].set_title('ArUco/OpenCV procedure stage durations')
         axes[1].set_ylabel('Duration (ms)')
         axes[1].grid(True, alpha=0.3)
@@ -1511,16 +1484,10 @@ class EKFPlotter:
             (detector_events, 'cv_bridge_ms', 'cv_bridge'),
             (detector_events, 'rectify_ms', 'rectify'),
             (detector_events, 'detect_left_ms', 'detect L'),
-<<<<<<< HEAD
             (stereo_detector_events, 'detect_right_ms', 'detect R'),
             (stereo_detector_events, 'raw_pose_ms', 'raw pose diag'),
             (stereo_detector_events, 'stereo_pnp_ms', 'stereo PnP'),
-            (monocular_detector_events, 'stereo_pnp_ms', 'mono IPPE'),
-=======
-            (detector_events, 'detect_right_ms', 'detect R'),
-            (detector_events, 'raw_pose_ms', 'raw PnP'),
-            (detector_events, 'stereo_pnp_ms', 'stereo PnP'),
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
+            (monocular_detector_events, 'stereo_pnp_ms', 'mono ArUco pose'),
             (detector_events, 'detector_total_ms', 'detector total'),
             (ekf_events, 'callback_total_ms', 'EKF callback'),
         ]
@@ -1536,7 +1503,6 @@ class EKFPlotter:
                 distributions.append(values)
                 distribution_labels.append(label)
         if distributions:
-<<<<<<< HEAD
             # Matplotlib first coerces its input with np.asarray().  Recent
             # NumPy versions reject a plain list of differently sized series
             # as a ragged array, so preserve each latency series as one object.
@@ -1545,10 +1511,6 @@ class EKFPlotter:
                 boxplot_data[index] = np.asarray(values, dtype=float)
             axes[3].boxplot(
                 boxplot_data, labels=distribution_labels,
-=======
-            axes[3].boxplot(
-                distributions, labels=distribution_labels,
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
                 showfliers=True, whis=(5, 95)
             )
         axes[3].set_title('Stage latency distributions (boxes; whiskers P5–P95)')

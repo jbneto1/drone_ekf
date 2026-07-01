@@ -1,175 +1,305 @@
 # =============================================================================
-# EKF configuration for drone pose relative to the landpad frame.
+# EKF configuration: drone pose expressed in the landpad frame
 #
-# Current active architecture:
-# - Prediction: PX4 body-frame velocity + body angular rate
-# - Updates: ArUco x/y + z + yaw, laser z, optional UWB x/y
-# - State frame: drone pose expressed in the landpad frame
+# ACTIVE ARCHITECTURE
+#   Prediction: PX4 body-frame velocity + body angular rate.
+#   Updates:    ArUco x/y, z, yaw; laser z; optional thermal and UWB.
+#
+# TOGGLE HIERARCHY (highest priority first)
+#   1. flight_optimized
+#      Overrides optional EKF observability/debug outputs, but never disables
+#      sensor fusion, /ekf/pose, /ekf/odom, or required TF publication.
+#   2. sensors.<sensor>.enabled
+#      Parent switch controlling subscription and all updates from that sensor.
+#   3. Sensor component switches
+#      Select which state components an enabled sensor may update.
+#   4. mahalanobis.<sensor>.enabled/component overrides
+#      Statistical rejection applied only to component updates enabled above.
+#
+# Plotter settings configure the separate plotter process and do not tune EKF
+# fusion. Comments and section ordering do not change runtime behavior.
 # =============================================================================
 
-# Master deployment switch. When true, the EKF keeps operational pose, odometry,
-# TF, and sensor fusion active, but disables optional dashboards, JSON debug
-# topics, diagnostics, raw measurement mirrors, dead-reckoning comparison, and
-# controller-frame diagnostics to minimize Jetson CPU/ROS serialization load.
+# -----------------------------------------------------------------------------
+# 1. MASTER DEPLOYMENT OVERRIDE
+# -----------------------------------------------------------------------------
+
+# true:
+#   Keeps fusion, /ekf/pose, /ekf/odom, and TF active.
+#   Forces terminal dashboard and line logs OFF.
+#   Suppresses JSON debug topics, sensor-status/diagnostic topics, transformed
+#   measurement mirrors, dead-reckoning comparison, and controller diagnostics.
+# false:
+#   Honors individual debug/diagnostic settings below.
 flight_optimized: false
 
+# -----------------------------------------------------------------------------
+# 2. EKF TERMINAL DEBUGGING
+#
+# OVERRIDE: flight_optimized=true forces every Boolean in this section false.
+# IMPORTANT: these fields do NOT control JSON debug publishers. JSON debug
+# publishers are controlled only by flight_optimized.
+# -----------------------------------------------------------------------------
+
 debug:
-  # One compact terminal view for flight/replay debugging. The individual JSON
-  # debug topics below are still published for plotter and rosbag analysis.
+  # Legacy dashboard default only. If the explicit 'dashboard' key is present,
+  # that key wins. Therefore enabled=false does NOT disable dashboard=true.
   enabled: true
+
+  # Explicit compact terminal dashboard switch.
   dashboard: true
+
+  # The following three fields are ignored when dashboard=false.
   dashboard_clear_screen: true
   dashboard_period: 0.5
   dashboard_recent_events: 8
 
-  # Legacy line-by-line logs. Keep these off by default so the dashboard does
-  # not scroll away; enable temporarily only when you need raw ROS log lines.
+  # Independent line-by-line ROS logs. They do not require enabled/dashboard.
+  # Keep them false during normal operation to avoid terminal/formatting load.
   log_innovations: false
   log_covariance: false
   log_prediction: false
 
-# Loaded by ekf.launch before nodes start. Keep runtime launch choices here so
-# normal replay/testing can be driven by editing this file only.
+# -----------------------------------------------------------------------------
+# 3. ROS CLOCK AND CONTROLLER INTERFACE
+# -----------------------------------------------------------------------------
+
+# true requires a /clock publisher (rosbag or simulator).
+# For real flight without /clock, set false or ROS time will not advance.
 /use_sim_time: true
+
+# Operational fused pose topic consumed by the controller.
 /controller_pose_topic: '/ekf/pose'
 
+# -----------------------------------------------------------------------------
+# 4. OPTIONAL CONTROLLER-FRAME DIAGNOSTIC NODE
+#
+# OVERRIDE: flight_optimized=true disables this complete node even if
+# controller_frame_diagnostics.enabled=true.
+# -----------------------------------------------------------------------------
+
 controller_frame_diagnostics:
+  # Parent switch for every field and topic in this subsection.
   enabled: true
+
+  # Ignored when enabled=false. Controls terminal logs only.
   log_to_screen: false
+
+  # All remaining fields are ignored when enabled=false.
   rate_hz: 10.0
   yaw_target_rad: 1.57079632679
-  csv_path: ''
-  max_age_warn: 0.5
+  csv_path: ''                    # Empty disables CSV output.
+  max_age_warn: 0.5               # Warning threshold; does not reject EKF data.
   topics:
     ekf_pose: '/ekf/pose'
     ekf_odom: '/ekf/odom'
-    # Empty by default to avoid recording a duplicate /ekf/pose stream.
-    # Set this to the controller's consumed pose topic when it differs.
+
+    # Empty avoids recording a duplicate /ekf/pose stream. Set only when the
+    # controller consumes a different pose topic.
     controller_pose: ''
+
     thermal_pose: '/thermal/pose'
     local_pose: '/mavros/local_position/pose'
     raw_controller_cmd: '/controller/raw_cmd_vel'
     mavros_cmd: '/mavros/setpoint_velocity/cmd_vel'
 
+# -----------------------------------------------------------------------------
+# 5. EKF INITIALIZATION
+# -----------------------------------------------------------------------------
+
 initialization:
-  # Diagonal entries of the initial covariance matrix P.
+  # Diagonal entries of the initial covariance P.
   P_init:
-    position: [0.05, 0.05, 0.10]       # m^2
-    velocity: [0.50, 0.50, 0.25]       # (m/s)^2
+    position: [0.05, 0.05, 0.10]            # variance [m^2]
+    velocity: [0.50, 0.50, 0.25]            # variance [(m/s)^2]
     orientation: [0.05, 0.05, 0.05, 0.05]  # quaternion-component variance
 
-  # Wait for the first ArUco pose before switching to TRACKING.
+  # true + sensors.aruco.enabled=true:
+  #   Remain WAITING until a valid ArUco measurement initializes the state.
+  # false OR sensors.aruco.enabled=false:
+  #   Trigger alternative initialization after the startup delay.
   wait_for_aruco: true
 
-  # Used only when wait_for_aruco is false.
-  default_position: [0.0, 0.0, 0.1]               # m, landpad frame
-  default_orientation: [0.0, 0.0, -0.7071068, 0.7071068]  # quaternion [x,y,z,w]
+  # Used only by alternative initialization.
+  default_position: [0.0, 0.0, 0.1]                       # m, landpad frame
+  default_orientation: [0.0, 0.0, -0.7071068, 0.7071068] # quaternion [x,y,z,w]
   alternative_covariance_scale: 2.0
+
+# -----------------------------------------------------------------------------
+# 6. SENSOR ENABLE/UPDATE HIERARCHY
+#
+# For every sensor, enabled=false means no subscription and every child setting
+# is ignored. max_age<=0 disables that sensor's stale-message rejection.
+# -----------------------------------------------------------------------------
 
 sensors:
   aruco:
+    # Parent for all ArUco marker subscriptions and all ArUco updates.
     enabled: true
-    position_update: true         # legacy parent switch for ArUco position updates
-    xy_update: true               # x/y update, independently gated
-    z_update: true                # z update, independently gated
-    orientation_update: true      # yaw-only update
-    max_age: 0.3                 # seconds; measured ArUco age is often 0.17-0.31 s
+
+    # Parent for xy_update and z_update only.
+    # false disables both position components regardless of their child values.
+    position_update: true
+
+    # Children of position_update; independently select horizontal/vertical.
+    xy_update: true
+    z_update: true
+
+    # Independent of position_update; controls yaw-only correction.
+    orientation_update: true
+
+    # Reject ArUco messages older than this. <=0 disables age rejection.
+    max_age: 0.3
+
+    # Per-marker measurement variances. Larger values make the EKF trust that
+    # marker less. These override measurement_noise.aruco for listed IDs.
     markers:
       '417':
         topic: '/aruco/pose/marker_417'
-        position_noise: [0.02, 0.02, 0.02]      # variance [m^2]
-        orientation_noise_yaw: 0.02            # variance [rad^2]
+        position_noise: [0.02, 0.02, 0.02]  # variance [m^2]
+        orientation_noise_yaw: 0.02         # variance [rad^2]
       '363':
         topic: '/aruco/pose/marker_363'
-        position_noise: [0.06, 0.06, 0.06]      # variance [m^2]
-        orientation_noise_yaw: 0.06             # variance [rad^2]
+        position_noise: [0.06, 0.06, 0.06]  # variance [m^2]
+        orientation_noise_yaw: 0.06         # variance [rad^2]
       '682':
         topic: '/aruco/pose/marker_682'
-        position_noise: [0.18, 0.18, 0.18]      # variance [m^2]
-        orientation_noise_yaw: 0.18             # variance [rad^2]
+        position_noise: [0.18, 0.18, 0.18]  # variance [m^2]
+        orientation_noise_yaw: 0.18         # variance [rad^2]
 
   thermal:
+    # Parent for every thermal field below.
     enabled: false
     topic: '/thermal/pose'
+
+    # Independent component switches when thermal is enabled.
     position_update: true
-    orientation_update: true      # yaw-only update
+    orientation_update: true       # yaw-only correction
+
+    # Used only while the EKF is WAITING. true permits a valid thermal
+    # measurement to establish the initial pose.
     allow_initialization: false
-    max_age: 0.5                  # seconds
+
+    # <=0 disables thermal age rejection.
+    max_age: 0.5
 
   laser:
+    # Parent for laser altitude subscription and z correction.
     enabled: true
     topic: '/mavros/altitude'
 
   uwb:
+    # Parent for UWB subscription and x/y correction.
     enabled: false
     topic: '/dwm1001/id_uwb_map/pose_kf'
-    max_age: 0.5                  # seconds; reject stale UWB pose updates
+
+    # <=0 disables UWB age rejection.
+    max_age: 0.5
 
   px4_velocity:
+    # Parent for the velocity-driven prediction callback.
     enabled: true
     topic: '/mavros/local_position/velocity_body'
-    # PX4/MAVROS source period. The recorded stream averages 29.998 Hz.
-    # EKF integration always uses 1/sample_rate_hz; callback jitter and delayed
-    # transport are observed for diagnostics but never change the process dt.
+
+    # Fixed integration dt = 1/sample_rate_hz. Callback jitter is diagnostic
+    # information and does not change the prediction dt.
     sample_rate_hz: 30.0
-    use_z: false                  # z in the process model intentionally disabled
+
+    # false zeroes body-frame vertical velocity before prediction.
+    # true includes the received z velocity.
+    use_z: false
+
+# -----------------------------------------------------------------------------
+# 7. PROCESS MODEL
+#
+# Used only when sensors.px4_velocity.enabled=true and prediction callbacks run.
+# Larger Q values grow uncertainty faster and reduce confidence in prediction.
+# -----------------------------------------------------------------------------
 
 process_model:
-  # This is PX4 velocity dead reckoning, not raw IMU mechanization.
+  # PX4 velocity dead reckoning, not raw-IMU mechanization.
   type: 'PX4_Velocity'
   Q:
-    position: [10, 10, 10]           # variance [m^2 / s]
-    velocity: [10, 10, 10]            # variance [(m/s)^2 / s]
-    orientation: [10, 10, 10, 10]   # quaternion-component variance / s
+    position: [10, 10, 10]          # variance rate [m^2/s]
+    velocity: [10, 10, 10]          # variance rate [(m/s)^2/s]
+    orientation: [10, 10, 10, 10]  # quaternion-component variance rate
+
+# -----------------------------------------------------------------------------
+# 8. OUTPUT TIMESTAMP MODE
+# -----------------------------------------------------------------------------
 
 output:
-  # Use current ROS time for fused outputs so /ekf/odom and dead reckoning
-  # remain monotonic even when delayed measurements trigger an update.
-  # Set to 'measurement' to stamp outputs with the triggering sensor header.
+  # 'current': stamp fused output with current ROS time; preserves monotonic
+  #            output when a delayed measurement triggers an update.
+  # 'measurement': use the triggering sensor header stamp when nonzero.
   stamp_mode: 'current'
+
+# -----------------------------------------------------------------------------
+# 9. MEASUREMENT NOISE
+#
+# These values matter only when the corresponding sensor/component update is
+# enabled. Larger variance gives that measurement less Kalman influence.
+# -----------------------------------------------------------------------------
 
 measurement_noise:
   aruco:
-    # Fallback only. Configured markers use sensors.aruco.markers.* noise.
-    position: [0.08, 0.08, 0.12]   # [m^2]
-    yaw: 0.05                      # [rad^2]
+    # Fallback only; listed markers use sensors.aruco.markers.* variances.
+    position: [0.08, 0.08, 0.12]  # variance [m^2]
+    yaw: 0.05                     # variance [rad^2]
 
   thermal:
-    position: [0.16, 0.16, 0.25]   # [m^2]
-    yaw: 0.09                      # [rad^2]
+    position: [0.16, 0.16, 0.25] # variance [m^2]
+    yaw: 0.09                     # variance [rad^2]
 
   laser:
-    z: [0.005]                      # [m^2]
+    z: [0.005]                    # variance [m^2]
 
   uwb:
-    xy: [0.2, 0.2]               # [m^2]
+    xy: [0.2, 0.2]               # variance [m^2]
+
+# -----------------------------------------------------------------------------
+# 10. MAHALANOBIS/NIS REJECTION
+#
+# A gate is reached only if both the sensor and corresponding component update
+# are enabled. enabled=false accepts statistically large innovations; it does
+# not disable the sensor update itself. Thresholds are ignored while disabled.
+#
+# Optional component switches such as xy_enabled, z_enabled, and yaw_enabled
+# may override a sensor's common enabled field when added.
+# -----------------------------------------------------------------------------
 
 mahalanobis:
   aruco:
-    # Master switch. Optional per-component overrides are xy_enabled,
-    # z_enabled, and yaw_enabled if you want to gate only some components.
     enabled: true
     xy_threshold: 9.210           # chi^2, 2 DOF, 99%
     z_threshold: 6.635            # chi^2, 1 DOF, 99%
     yaw_threshold: 6.635          # chi^2, 1 DOF, 99%
+
   laser:
     enabled: false
     z_threshold: 10.828           # chi^2, 1 DOF, 99.9%
+
   uwb:
     enabled: false
     xy_threshold: 9.210           # chi^2, 2 DOF, 99%
+
   thermal:
     enabled: false
     position_threshold: 11.345
     yaw_threshold: 6.635
 
-# Format: row-major 4x4 homogeneous matrix
+# -----------------------------------------------------------------------------
+# 11. SENSOR-TO-DRONE TRANSFORMS
+#
+# Row-major homogeneous 4x4 format:
 # [R11,R12,R13,tx, R21,R22,R23,ty, R31,R32,R33,tz, 0,0,0,1]
+#
+# Each transform matters only when its corresponding sensor is enabled.
+# -----------------------------------------------------------------------------
+
 transforms:
-  # Transform from the detector's LEFT-camera reference frame to drone body.
-  # Both aruco_detector.yaml pose modes preserve this same output frame.
-  # Camera axes are project-specific; comments below describe the active matrix,
-  # not a generic convention:
+  # BOTH ArUco detector modes publish in the LEFT-camera frame and therefore
+  # use this same transform. Active project-specific axis mapping:
   #   drone_x = +camera_y
   #   drone_y = +camera_x
   #   drone_z = -camera_z
@@ -205,6 +335,7 @@ transforms:
       0.0, 0.0, 0.0, 1.000
     ]
 
+# Used only when sensors.uwb.enabled=true.
 T_uwb_map_to_landpad:
   matrix: [
     1.0, 0.0, 0.0, -0.4475,
@@ -213,42 +344,77 @@ T_uwb_map_to_landpad:
     0.0, 0.0, 0.0, 1.000
   ]
 
+# -----------------------------------------------------------------------------
+# 12. ROS TOPIC NAMES
+#
+# Topic-name fields do not enable features. Their publishers/subscribers exist
+# only when the owning feature is enabled.
+# -----------------------------------------------------------------------------
+
 output_topics:
+  # Operational outputs: always active, including flight_optimized mode.
   ekf_pose: '/ekf/pose'
   ekf_odom: '/ekf/odom'
+
+  # Comparison/debug output: disabled by flight_optimized.
   dead_reckoning: '/ekf/dead_reckoning'
 
+  # Transformed measurement mirrors: disabled by flight_optimized.
   aruco_marker_measurement_prefix: '/ekf/measurements/aruco/marker_'
   thermal_measurement: '/ekf/measurements/thermal'
   laser_measurement: '/ekf/measurements/laser'
   uwb_measurement: '/ekf/measurements/uwb'
 
+  # EKF status/debug outputs: disabled by flight_optimized.
   sensor_status: '/ekf/sensor_status'
   innovation_debug: '/ekf/debug/innovation'
   covariance_debug: '/ekf/debug/covariance'
   kalman_gain_debug: '/ekf/debug/kalman_gain'
   timing_debug: '/ekf/debug/timing'
+
+  # External detector/camera diagnostic topics consumed by the plotter.
+  # Their actual publication is controlled by aruco_detector.yaml.
   aruco_marker_quality: '/aruco/debug/marker_quality'
   stereo_camera_timing: '/stereo/debug/timing'
   aruco_detector_timing: '/aruco/debug/timing'
 
+# -----------------------------------------------------------------------------
+# 13. PLOTTER-ONLY SETTINGS
+#
+# These configure drone_ekf/scripts/plotter.py, not EKF fusion. They matter only
+# when the plotter node/process is launched.
+# -----------------------------------------------------------------------------
+
 plotter:
   save_dir: '($find drone_ekf)/ekf_plots'
+
+  # Storage/downsampling limits. Lower values reduce plotting memory/work.
   max_points: 6000
-  max_plot_points: 1600
-  max_event_points: 1600
-  dpi: 300
+  max_plot_points: 800
+  max_event_points: 800
+
+  # Figure output quality/cost.
+  dpi: 160
   tight_bbox: false
+
+  # 0 means no internal deadline for final plot generation.
   shutdown_timeout_sec: 0.0
+
+  # true saves final plots in a detached child process.
+  # shutdown_save_log is primarily used by that detached save.
   detached_shutdown_save: true
   shutdown_save_log: '($find drone_ekf)/ekf_plots/plotter_shutdown_save.log'
+
+  # Display limits only; these do not change Mahalanobis rejection.
   nis:
     ylim: [0, 15]
     sqrt_ylim: [0, 4]
+
   covariance:
-    mode: 'variance'                   # std or variance
-    yscale: 'log'                 # log or linear
+    mode: 'std'                   # 'std' or 'variance'
+    yscale: 'log'                 # 'log' or 'linear'
+
   yaw:
-    show_dead_reckoning: false
+    show_dead_reckoning: false    # Plot-series visibility only.
     ylim: [-200, 200]
     unwrap: false

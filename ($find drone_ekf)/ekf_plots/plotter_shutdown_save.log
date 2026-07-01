@@ -1,0 +1,31 @@
+
+======================================================================
+[PLOTTER CHILD] Detached save started. PID=46519
+[PLOTTER CHILD] Saving to: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots
+======================================================================
+[INFO] [1782920929.875199]: [PLOTTER] Generating plots with prefix: final
+[INFO] [1782920933.475794]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/aruco_latency_profile_final.png
+[INFO] [1782920933.485833]: [PLOTTER] Generated 1 plot(s) in /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots (3.6 s)
+[PLOTTER] All available plots saved successfully!
+[PLOTTER] Generated: 1 plot(s)
+[PLOTTER] Location: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots
+[PLOTTER CHILD] Detached save finished
+
+======================================================================
+[PLOTTER CHILD] Detached save started. PID=49256
+[PLOTTER CHILD] Saving to: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots
+======================================================================
+[INFO] [1782921531.489449, 1718658376.874515]: [PLOTTER] Generating plots with prefix: final
+[INFO] [1782921534.215539, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/combined_comparison_final.png
+[INFO] [1782921536.466189, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/innovations_final.png
+[INFO] [1782921537.937976, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/nis_final.png
+[INFO] [1782921542.179839, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/covariance_final.png
+[INFO] [1782921545.040085, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/kalman_gain_final.png
+[INFO] [1782921547.657262, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/aruco_marker_quality_final.png
+[INFO] [1782921567.725230, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/timing_diagnostics_final.png
+[INFO] [1782921571.428271, 1718658376.874515]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots/aruco_latency_profile_final.png
+[INFO] [1782921571.432035, 1718658376.874515]: [PLOTTER] Generated 8 plot(s) in /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots (39.9 s)
+[PLOTTER] All available plots saved successfully!
+[PLOTTER] Generated: 8 plot(s)
+[PLOTTER] Location: /home/berger/catkin_ws/src/drone_ekf/($find drone_ekf)/ekf_plots
+[PLOTTER CHILD] Detached save finished

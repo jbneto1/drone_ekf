@@ -622,11 +622,8 @@ class DroneEKF:
                                       callback_start_stamp,
                                       callback_start_wall, status, timings):
         """Publish a consolidated detector-pose-to-EKF callback profile."""
-<<<<<<< HEAD
         if self.timing_pub is None:
             return
-=======
->>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
         now = rospy.Time.now().to_sec()
         stamp = (
             float(header.stamp.to_sec())
