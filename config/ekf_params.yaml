@@ -233,7 +233,7 @@ output_topics:
   aruco_detector_timing: '/aruco/debug/timing'
 
 plotter:
-  save_dir: '/tmp/ekf_plots'
+  save_dir: '($find drone_ekf)/ekf_plots'
   max_points: 6000
   max_plot_points: 1600
   max_event_points: 1600
@@ -241,7 +241,7 @@ plotter:
   tight_bbox: false
   shutdown_timeout_sec: 0.0
   detached_shutdown_save: true
-  shutdown_save_log: '/tmp/ekf_plots/plotter_shutdown_save.log'
+  shutdown_save_log: '($find drone_ekf)/ekf_plots/plotter_shutdown_save.log'
   nis:
     ylim: [0, 15]
     sqrt_ylim: [0, 4]
