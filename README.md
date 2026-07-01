@@ -51,6 +51,7 @@ this camera path does not expose a hardware exposure timestamp.
 `capture_read_ms` therefore reports driver/acquisition blocking separately and
 is not part of the header-age calculation.
 
+<<<<<<< HEAD
 ### Detector pose mode and flight-optimized operation
 
 `iris_land/config/aruco_detector.yaml` selects the pose pipeline:
@@ -79,6 +80,8 @@ estimation to reject implausible frame-to-frame planar-marker orientation
 flips. It compares rotation matrices, so equivalent quaternion signs are not
 mistaken for a flip.
 
+=======
+>>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
 ## 🔧 Installation
 
 ### 1. Build the package

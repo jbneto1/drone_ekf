@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 #!/usr/bin/env bash
 
 status_file="$(mktemp)"
@@ -67,3 +68,14 @@ echo ""
 
 # -F retries until the detached child creates the file and follows it by name.
 tail -n +1 -F -- "${saver_log}"
+=======
+#!/bin/bash
+roslaunch drone_ekf plotter.launch
+
+echo ""
+echo "Plotter launch exited."
+echo "Watching detached saver log. Press Ctrl+C to stop watching."
+echo ""
+
+tail -f /tmp/ekf_plots/plotter_shutdown_save.log
+>>>>>>> e84c788dbc0ef7ce1361fea8f839097d2e8d50db
