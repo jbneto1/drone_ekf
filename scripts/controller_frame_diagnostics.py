@@ -140,8 +140,11 @@ class ControllerFrameDiagnostics:
 
         config = self.load_config()
         diag_cfg = config.get('controller_frame_diagnostics', {})
-        if not diag_cfg.get('enabled', True):
-            rospy.loginfo('[FRAME_DIAG] Disabled by controller_frame_diagnostics.enabled')
+        if config.get('flight_optimized', False) or not diag_cfg.get('enabled', True):
+            rospy.loginfo(
+                '[FRAME_DIAG] Disabled by flight_optimized or '
+                'controller_frame_diagnostics.enabled'
+            )
             rospy.signal_shutdown('disabled by config')
             return
 

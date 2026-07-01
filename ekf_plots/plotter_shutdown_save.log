@@ -1,0 +1,41 @@
+
+======================================================================
+[PLOTTER CHILD] Detached save started. PID=18574
+[PLOTTER CHILD] Saving to: /home/berger/catkin_ws/src/drone_ekf/ekf_plots
+======================================================================
+[INFO] [1782902025.468992, 1718658376.874436]: [PLOTTER] Generating plots with prefix: final
+[INFO] [1782902029.249615, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/combined_comparison_final.png
+[INFO] [1782902032.436489, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/innovations_final.png
+[INFO] [1782902034.807901, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/nis_final.png
+[INFO] [1782902039.445728, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/covariance_final.png
+[INFO] [1782902042.375237, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/kalman_gain_final.png
+[INFO] [1782902044.959468, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/aruco_marker_quality_final.png
+[INFO] [1782902083.472548, 1718658376.874436]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/timing_diagnostics_final.png
+[ERROR] [1782902083.873088, 1718658376.874436]: [PLOTTER] Failed while generating ArUco latency profile: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (8,) + inhomogeneous part.
+[INFO] [1782902083.891942, 1718658376.874436]: [PLOTTER] Generated 7 plot(s) in /home/berger/catkin_ws/src/drone_ekf/ekf_plots (58.4 s)
+[ERROR] [1782902083.894977, 1718658376.874436]: [PLOTTER] Failed plots: ArUco latency profile
+[PLOTTER] Some plots failed:
+  - ArUco latency profile: setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (8,) + inhomogeneous part.
+[PLOTTER] All available plots saved successfully!
+[PLOTTER] Generated: 7 plot(s)
+[PLOTTER] Location: /home/berger/catkin_ws/src/drone_ekf/ekf_plots
+[PLOTTER CHILD] Detached save finished
+
+======================================================================
+[PLOTTER CHILD] Detached save started. PID=26265
+[PLOTTER CHILD] Saving to: /home/berger/catkin_ws/src/drone_ekf/ekf_plots
+======================================================================
+[INFO] [1782909838.477416, 1718658376.879170]: [PLOTTER] Generating plots with prefix: final
+[INFO] [1782909842.305206, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/combined_comparison_final.png
+[INFO] [1782909845.562382, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/innovations_final.png
+[INFO] [1782909847.789499, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/nis_final.png
+[INFO] [1782909852.721569, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/covariance_final.png
+[INFO] [1782909855.754075, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/kalman_gain_final.png
+[INFO] [1782909858.293504, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/aruco_marker_quality_final.png
+[INFO] [1782909895.967937, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/timing_diagnostics_final.png
+[INFO] [1782909902.094012, 1718658376.879170]: [PLOTTER] Saved: /home/berger/catkin_ws/src/drone_ekf/ekf_plots/aruco_latency_profile_final.png
+[INFO] [1782909902.097749, 1718658376.879170]: [PLOTTER] Generated 8 plot(s) in /home/berger/catkin_ws/src/drone_ekf/ekf_plots (63.6 s)
+[PLOTTER] All available plots saved successfully!
+[PLOTTER] Generated: 8 plot(s)
+[PLOTTER] Location: /home/berger/catkin_ws/src/drone_ekf/ekf_plots
+[PLOTTER CHILD] Detached save finished

@@ -116,6 +116,9 @@ class EKFPlotter:
         self.kalman_gain_events = EventBuffer(max_pts)
         self.marker_quality_events = EventBuffer(max_pts)
         self.timing_events = EventBuffer(max_pts)
+        self.camera_timing_events = EventBuffer(max_pts)
+        self.aruco_detector_timing_events = EventBuffer(max_pts)
+        self.aruco_ekf_timing_events = EventBuffer(max_pts)
 
         self.sensor_config = {
             'aruco': {'enabled': False, 'active': False},
@@ -160,10 +163,17 @@ class EKFPlotter:
         self.tight_bbox = plotter_cfg.get('tight_bbox', False)
         self.shutdown_timeout_sec = float(plotter_cfg.get('shutdown_timeout_sec', 0.0))
         self.detached_shutdown_save = bool(plotter_cfg.get('detached_shutdown_save', True))
-        self.shutdown_save_log = plotter_cfg.get(
-            'shutdown_save_log',
-            os.path.join(self.save_dir, 'plotter_shutdown_save.log')
+        configured_shutdown_log = plotter_cfg.get('shutdown_save_log', '')
+        self.shutdown_save_log = (
+            self.resolve_config_path(configured_shutdown_log)
+            if configured_shutdown_log
+            else os.path.join(self.save_dir, 'plotter_shutdown_save.log')
         )
+        os.makedirs(os.path.dirname(self.shutdown_save_log), exist_ok=True)
+        self.shutdown_status_file = os.environ.get(
+            'DRONE_EKF_PLOTTER_STATUS_FILE', ''
+        )
+        self.write_shutdown_status('initialized')
 
         plt.rcParams['path.simplify'] = True
         plt.rcParams['agg.path.chunksize'] = 10000
@@ -177,7 +187,37 @@ class EKFPlotter:
         self.setup_subscribers()
 
         rospy.loginfo(f"[PLOTTER] Initialized. Saving to: {self.save_dir}")
+        rospy.loginfo(f"[PLOTTER] Detached saver log: {self.shutdown_save_log}")
         rospy.loginfo("[PLOTTER] Waiting for data...")
+
+    def resolve_config_path(self, configured_path):
+        """Resolve ~, environment variables, and config-relative output paths."""
+        expanded = os.path.expandvars(os.path.expanduser(str(configured_path)))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(self.config_path_base, expanded)
+        return os.path.abspath(expanded)
+
+    def write_shutdown_status(self, state, pid=None, error=None):
+        """Atomically report saver state to the optional shell wrapper."""
+        if not self.shutdown_status_file:
+            return
+
+        status_path = os.path.abspath(
+            os.path.expandvars(os.path.expanduser(self.shutdown_status_file))
+        )
+        status_dir = os.path.dirname(status_path)
+        temporary_path = f"{status_path}.tmp.{os.getpid()}"
+        try:
+            if status_dir:
+                os.makedirs(status_dir, exist_ok=True)
+            with open(temporary_path, 'w') as status_file:
+                status_file.write(f"{state}\n")
+                status_file.write(f"{self.shutdown_save_log}\n")
+                status_file.write(f"{pid if pid is not None else ''}\n")
+                status_file.write(f"{error if error is not None else ''}\n")
+            os.replace(temporary_path, status_path)
+        except OSError as exc:
+            rospy.logwarn("[PLOTTER] Could not write shutdown status: %s", exc)
 
     def load_config(self):
         """Load configuration from YAML."""
@@ -185,6 +225,19 @@ class EKFPlotter:
         if not config_path:
             pkg_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             config_path = os.path.join(pkg_path, 'config', 'ekf_params.yaml')
+        config_path = os.path.abspath(
+            os.path.expandvars(os.path.expanduser(config_path))
+        )
+        self.config_path = config_path
+
+        # A relative output path in config/ekf_params.yaml belongs to the
+        # package directory, not roslaunch's process cwd (usually ~/.ros).
+        config_dir = os.path.dirname(config_path)
+        self.config_path_base = (
+            os.path.dirname(config_dir)
+            if os.path.basename(config_dir) == 'config'
+            else config_dir
+        )
 
         self.config = {}
         if os.path.exists(config_path):
@@ -192,9 +245,11 @@ class EKFPlotter:
                 self.config = yaml.safe_load(f)
             rospy.loginfo(f"[PLOTTER] Loaded config from: {config_path}")
 
-        self.save_dir = self.config.get('plotter', {}).get('save_dir', '/tmp/ekf_plots')
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+        configured_save_dir = self.config.get(
+            'plotter', {}
+        ).get('save_dir', '/tmp/ekf_plots')
+        self.save_dir = self.resolve_config_path(configured_save_dir)
+        os.makedirs(self.save_dir, exist_ok=True)
 
     def setup_subscribers(self):
         """Setup ROS subscribers."""
@@ -257,6 +312,14 @@ class EKFPlotter:
         rospy.Subscriber(
             topics.get('timing_debug', '/ekf/debug/timing'),
             String, self.timing_callback, queue_size=200
+        )
+        rospy.Subscriber(
+            topics.get('stereo_camera_timing', '/stereo/debug/timing'),
+            String, self.camera_timing_callback, queue_size=200
+        )
+        rospy.Subscriber(
+            topics.get('aruco_detector_timing', '/aruco/debug/timing'),
+            String, self.aruco_detector_timing_callback, queue_size=200
         )
 
     def relative_time_from_sec(self, stamp_sec):
@@ -364,6 +427,22 @@ class EKFPlotter:
         event = self.parse_debug_event(msg)
         if event is not None:
             self.timing_events.add(event)
+            if event.get('stage') == 'aruco_callback_profile':
+                self.aruco_ekf_timing_events.add(event)
+
+    def camera_timing_callback(self, msg):
+        if self.shutdown_complete:
+            return
+        event = self.parse_debug_event(msg)
+        if event is not None:
+            self.camera_timing_events.add(event)
+
+    def aruco_detector_timing_callback(self, msg):
+        if self.shutdown_complete:
+            return
+        event = self.parse_debug_event(msg)
+        if event is not None:
+            self.aruco_detector_timing_events.add(event)
 
     # ---------------------------------------------------------------------
     # Plot helpers
@@ -423,6 +502,41 @@ class EKFPlotter:
             self.legend_marker('black', accepted_label, marker='o', markersize=6),
             self.legend_marker('black', rejected_label, marker='x', markersize=7),
         ]
+
+    def time_key(self, t):
+        return round(float(t), 6)
+
+    def aruco_update_status_lookup(self):
+        component_axes = {
+            'position': ('x', 'y', 'z'),
+            'xy': ('x', 'y'),
+            'z': ('z',),
+            'yaw': ('yaw',),
+        }
+        lookup = {}
+        for event in self.innovation_events.list():
+            if event.get('sensor') != 'aruco':
+                continue
+            marker_id = event.get('marker_id')
+            if marker_id is None:
+                continue
+            axes = component_axes.get(event.get('component'))
+            if axes is None:
+                continue
+
+            accepted = bool(event.get('accepted', True))
+            key = self.time_key(event.get('t', 0.0))
+            for axis_key in axes:
+                lookup[(int(marker_id), axis_key, key)] = accepted
+        return lookup
+
+    def aruco_update_acceptance(self, lookup, marker_id, axis_key, times):
+        accepted = np.ones(len(times), dtype=bool)
+        for idx, t in enumerate(times):
+            status = lookup.get((int(marker_id), axis_key, self.time_key(t)))
+            if status is not None:
+                accepted[idx] = status
+        return accepted
 
     def save_figure(self, fig, filepath):
         if self.tight_bbox:
@@ -594,6 +708,15 @@ class EKFPlotter:
             len(self.timing_events) > 0 or len(self.innovation_events) > 0 or len(self.covariance_events) > 0,
             lambda: self.plot_timing_diagnostics(prefix)
         )
+        run_plot(
+            'ArUco latency profile',
+            (
+                len(self.camera_timing_events) > 0 or
+                len(self.aruco_detector_timing_events) > 0 or
+                len(self.aruco_ekf_timing_events) > 0
+            ),
+            lambda: self.plot_aruco_latency_profile(prefix)
+        )
 
         elapsed = time.time() - start_wall
         if plot_count == 0:
@@ -647,6 +770,8 @@ class EKFPlotter:
 
         all_handles = []
         all_labels = []
+        aruco_update_lookup = self.aruco_update_status_lookup()
+        plotted_rejected_aruco = False
 
         for ax_idx, (label, key) in enumerate(components):
             ax = axes[ax_idx]
@@ -689,14 +814,28 @@ class EKFPlotter:
                 if np.any(valid):
                     label_text = f'ArUco {marker_id}'
                     color = self.marker_colors.get(marker_id, 'black')
-                    t_plot, v_plot = self.thin_series(marker_data['times'][valid], marker_data[key][valid])
-                    scatter = ax.scatter(
-                        t_plot, v_plot,
-                        c=color, s=30, marker='o', alpha=0.75,
-                        label=label_text, edgecolors=color, linewidths=0.4, zorder=4
+                    times = marker_data['times'][valid]
+                    values = marker_data[key][valid]
+                    accepted_mask = self.aruco_update_acceptance(
+                        aruco_update_lookup, marker_id, key, times
                     )
+                    for accepted, marker_style, size, alpha, linewidth in (
+                        (True, 'o', 30, 0.75, 0.4),
+                        (False, 'x', 36, 0.95, 0.9),
+                    ):
+                        status_mask = accepted_mask if accepted else ~accepted_mask
+                        if not np.any(status_mask):
+                            continue
+                        t_plot, v_plot = self.thin_series(times[status_mask], values[status_mask])
+                        ax.scatter(
+                            t_plot, v_plot,
+                            c=color, s=size, marker=marker_style, alpha=alpha,
+                            edgecolors=color, linewidths=linewidth, zorder=4
+                        )
+                        if not accepted:
+                            plotted_rejected_aruco = True
                     if label_text not in all_labels:
-                        all_handles.append(scatter)
+                        all_handles.append(self.legend_marker(color, label_text, marker='o'))
                         all_labels.append(label_text)
 
             for sensor_name, sensor_data in (
@@ -730,7 +869,20 @@ class EKFPlotter:
                 ax.set_ylim(yaw_cfg['ylim'][0], yaw_cfg['ylim'][1])
 
         if all_handles:
-            axes[0].legend(all_handles, all_labels, loc='upper right', fontsize=9, ncol=2)
+            legend_title = None
+            if plotted_rejected_aruco:
+                status_handles = self.status_legend_handles(
+                    'Accepted ArUco update',
+                    'Rejected ArUco update'
+                )
+                all_handles.extend(status_handles)
+                all_labels.extend([handle.get_label() for handle in status_handles])
+                legend_title = 'Color: source/marker | Symbol: ArUco update status'
+            axes[0].legend(
+                all_handles, all_labels,
+                loc='upper right', fontsize=9, ncol=2,
+                title=legend_title
+            )
 
         process_model = self.sensor_config.get('process_model', 'Unknown')
         axes[0].annotate(
@@ -1035,6 +1187,8 @@ class EKFPlotter:
         if prediction_events:
             times = []
             dts = []
+            observed_times = []
+            observed_dts = []
             for event in prediction_events:
                 try:
                     dt = float(event.get('dt'))
@@ -1043,7 +1197,23 @@ class EKFPlotter:
                 if np.isfinite(dt):
                     times.append(event['t'])
                     dts.append(dt)
-            axes[2].plot(times, dts, color='tab:blue', linewidth=1.4, label='prediction dt')
+                try:
+                    observed_dt = float(event.get('observed_dt'))
+                except (TypeError, ValueError):
+                    observed_dt = None
+                if observed_dt is not None and np.isfinite(observed_dt):
+                    observed_times.append(event['t'])
+                    observed_dts.append(observed_dt)
+            axes[2].plot(
+                times, dts, color='tab:blue', linewidth=1.4,
+                label='fixed integration dt'
+            )
+            if observed_dts:
+                axes[2].plot(
+                    observed_times, observed_dts,
+                    color='tab:orange', linewidth=1.0, alpha=0.8,
+                    label='observed source-message spacing'
+                )
             axes[2].legend(loc='upper right', fontsize=8)
         else:
             axes[2].annotate(
@@ -1053,7 +1223,10 @@ class EKFPlotter:
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
             )
         axes[2].set_ylabel('Prediction dt (s)', fontsize=11)
-        axes[2].set_title('Prediction integration dt', fontsize=11)
+        axes[2].set_title(
+            'Fixed prediction dt versus observed message spacing',
+            fontsize=11
+        )
         axes[2].grid(True, alpha=0.3)
 
         axes[3].set_yticks(list(name_to_y.values()))
@@ -1092,6 +1265,313 @@ class EKFPlotter:
 
         plt.tight_layout()
         filepath = os.path.join(self.save_dir, f'timing_diagnostics_{prefix}.png')
+        self.save_figure(fig, filepath)
+
+    def plot_aruco_latency_profile(self, prefix):
+        """Correlate camera, detector, ROS-boundary, and EKF timing records."""
+        camera_events = self.thin_events(self.camera_timing_events.list())
+        detector_events = self.thin_events(self.aruco_detector_timing_events.list())
+        ekf_events = self.thin_events(self.aruco_ekf_timing_events.list())
+
+        def stamp_key(event):
+            try:
+                return round(float(event.get('stamp')), 6)
+            except (TypeError, ValueError):
+                return None
+
+        def finite_value(event, key):
+            try:
+                value = float(event.get(key))
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+
+        def plot_metric(ax, events, key, label, **kwargs):
+            points = [
+                (event['t'], finite_value(event, key))
+                for event in events
+            ]
+            points = [(t, value) for t, value in points if value is not None]
+            if points:
+                ax.plot(
+                    [point[0] for point in points],
+                    [point[1] for point in points],
+                    label=label, linewidth=1.1, **kwargs
+                )
+
+        camera_by_stamp = {
+            stamp_key(event): event
+            for event in camera_events
+            if stamp_key(event) is not None
+        }
+        detector_by_stamp = {
+            stamp_key(event): event
+            for event in detector_events
+            if stamp_key(event) is not None
+        }
+
+        image_ros_points = []
+        left_image_ros_points = []
+        right_image_ros_points = []
+        for detector_event in detector_events:
+            camera_event = camera_by_stamp.get(stamp_key(detector_event))
+            if camera_event is None:
+                continue
+            callback_stamp = finite_value(detector_event, 'callback_start_stamp')
+            publish_stamp = finite_value(camera_event, 'publish_complete_stamp')
+            detector_mode = detector_event.get('pose_estimation_mode', 'stereo')
+            if (
+                detector_mode == 'stereo' and
+                callback_stamp is not None and publish_stamp is not None
+            ):
+                image_ros_points.append(
+                    (detector_event['t'], (callback_stamp - publish_stamp) * 1000.0)
+                )
+            for points, receipt_key, publish_key in (
+                (
+                    left_image_ros_points,
+                    'left_subscriber_receipt_stamp',
+                    'left_publish_complete_stamp',
+                ),
+                (
+                    right_image_ros_points,
+                    'right_subscriber_receipt_stamp',
+                    'right_publish_complete_stamp',
+                ),
+            ):
+                receipt_stamp = finite_value(detector_event, receipt_key)
+                side_publish_stamp = finite_value(camera_event, publish_key)
+                if (
+                    receipt_stamp is not None and receipt_stamp > 0.0 and
+                    side_publish_stamp is not None and side_publish_stamp > 0.0
+                ):
+                    points.append(
+                        (
+                            detector_event['t'],
+                            (receipt_stamp - side_publish_stamp) * 1000.0,
+                        )
+                    )
+
+        pose_ros_points = []
+        for ekf_event in ekf_events:
+            detector_event = detector_by_stamp.get(stamp_key(ekf_event))
+            if detector_event is None:
+                continue
+            marker_id = ekf_event.get('marker_id')
+            publish_stamps = detector_event.get(
+                'marker_pose_publish_complete_stamps', {}
+            )
+            pose_publish_stamp = publish_stamps.get(str(marker_id))
+            callback_stamp = finite_value(ekf_event, 'callback_start_stamp')
+            try:
+                pose_publish_stamp = float(pose_publish_stamp)
+            except (TypeError, ValueError):
+                pose_publish_stamp = None
+            if (
+                callback_stamp is not None and
+                pose_publish_stamp is not None and
+                np.isfinite(pose_publish_stamp)
+            ):
+                pose_ros_points.append(
+                    (ekf_event['t'], (callback_stamp - pose_publish_stamp) * 1000.0)
+                )
+
+        fig, axes = plt.subplots(5, 1, figsize=(17, 22))
+        fig.suptitle(
+            'ArUco End-to-End Latency and Bottleneck Profile',
+            fontsize=14, fontweight='bold'
+        )
+        stereo_detector_events = [
+            event for event in detector_events
+            if event.get('pose_estimation_mode', 'stereo') == 'stereo'
+        ]
+        monocular_detector_events = [
+            event for event in detector_events
+            if event.get('pose_estimation_mode') == 'monocular'
+        ]
+
+        # Cross-process boundaries. The two ROS-overhead lines subtract the
+        # producer's publish-complete time from the consumer callback start.
+        plot_metric(axes[0], camera_events, 'capture_read_ms', 'V4L2 read/decode')
+        plot_metric(axes[0], camera_events, 'camera_pipeline_ms', 'Camera frame→publish')
+        plot_metric(
+            axes[0], detector_events, 'source_to_callback_ms',
+            'Frame→detector callback'
+        )
+        plot_metric(
+            axes[0], ekf_events, 'source_to_callback_ms',
+            'Frame→EKF callback'
+        )
+        if image_ros_points:
+            axes[0].plot(
+                [point[0] for point in image_ros_points],
+                [point[1] for point in image_ros_points],
+                label='ROS images→synchronized callback', linewidth=1.1
+            )
+        for points, label in (
+            (left_image_ros_points, 'ROS left image transport/queue'),
+            (right_image_ros_points, 'ROS right image transport/queue'),
+        ):
+            if points:
+                axes[0].plot(
+                    [point[0] for point in points],
+                    [point[1] for point in points],
+                    label=label, linewidth=0.9, alpha=0.8
+                )
+        plot_metric(
+            axes[0], stereo_detector_events, 'sync_dispatch_ms',
+            'Stereo sync dispatch'
+        )
+        if pose_ros_points:
+            axes[0].plot(
+                [point[0] for point in pose_ros_points],
+                [point[1] for point in pose_ros_points],
+                label='ROS pose transport/queue', linewidth=1.1
+            )
+        axes[0].axhline(0.0, color='black', linewidth=0.7, alpha=0.5)
+        axes[0].set_title('Cross-node latency boundaries')
+        axes[0].set_ylabel('Latency (ms)')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].legend(loc='upper right', fontsize=8, ncol=3)
+
+        detector_metrics = [
+            ('cv_bridge_ms', 'cv_bridge conversion/share'),
+            ('grayscale_ms', 'Grayscale'),
+            ('rectify_ms', 'Undistort/rectify'),
+            ('visualization_prepare_ms', 'Visualization prep'),
+            ('detect_left_ms', 'Detect left'),
+            ('pixel_gate_ms', 'Pixel gate'),
+            ('result_and_pose_publish_ms', 'Transform/result/publish'),
+        ]
+        for key, label in detector_metrics:
+            plot_metric(axes[1], detector_events, key, label)
+        for key, label in (
+            ('detect_right_ms', 'Detect right'),
+            ('stereo_match_ms', 'Stereo match'),
+            ('raw_pose_ms', 'Raw monocular diagnostics'),
+            ('stereo_pnp_ms', 'Sequential stereo PnP'),
+        ):
+            plot_metric(axes[1], stereo_detector_events, key, label)
+        plot_metric(
+            axes[1], monocular_detector_events, 'stereo_pnp_ms',
+            'ArUco IPPE square pose'
+        )
+        axes[1].set_title('ArUco/OpenCV procedure stage durations')
+        axes[1].set_ylabel('Duration (ms)')
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend(loc='upper right', fontsize=8, ncol=4)
+
+        ekf_metrics = [
+            ('stale_check_ms', 'Stale check'),
+            ('transform_ms', 'Camera→landpad transform'),
+            ('validation_ms', 'Validation'),
+            ('measurement_publish_ms', 'Measurement publish'),
+            ('initialization_ms', 'Initialization'),
+            ('xy_update_ms', 'EKF x/y update'),
+            ('z_update_ms', 'EKF z update'),
+            ('yaw_update_ms', 'EKF yaw update'),
+            ('estimate_publish_ms', 'Estimate/TF publish'),
+            ('callback_total_ms', 'Whole EKF callback'),
+        ]
+        for key, label in ekf_metrics:
+            plot_metric(axes[2], ekf_events, key, label)
+        axes[2].set_title('EKF ArUco callback stage durations')
+        axes[2].set_ylabel('Duration (ms)')
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend(loc='upper right', fontsize=8, ncol=4)
+
+        distribution_specs = [
+            (detector_events, 'cv_bridge_ms', 'cv_bridge'),
+            (detector_events, 'rectify_ms', 'rectify'),
+            (detector_events, 'detect_left_ms', 'detect L'),
+            (stereo_detector_events, 'detect_right_ms', 'detect R'),
+            (stereo_detector_events, 'raw_pose_ms', 'raw pose diag'),
+            (stereo_detector_events, 'stereo_pnp_ms', 'stereo PnP'),
+            (monocular_detector_events, 'stereo_pnp_ms', 'mono IPPE'),
+            (detector_events, 'detector_total_ms', 'detector total'),
+            (ekf_events, 'callback_total_ms', 'EKF callback'),
+        ]
+        distributions = []
+        distribution_labels = []
+        for events, key, label in distribution_specs:
+            values = [
+                finite_value(event, key)
+                for event in events
+            ]
+            values = [value for value in values if value is not None]
+            if values:
+                distributions.append(values)
+                distribution_labels.append(label)
+        if distributions:
+            # Matplotlib first coerces its input with np.asarray().  Recent
+            # NumPy versions reject a plain list of differently sized series
+            # as a ragged array, so preserve each latency series as one object.
+            boxplot_data = np.empty(len(distributions), dtype=object)
+            for index, values in enumerate(distributions):
+                boxplot_data[index] = np.asarray(values, dtype=float)
+            axes[3].boxplot(
+                boxplot_data, labels=distribution_labels,
+                showfliers=True, whis=(5, 95)
+            )
+        axes[3].set_title('Stage latency distributions (boxes; whiskers P5–P95)')
+        axes[3].set_ylabel('Duration (ms)')
+        axes[3].tick_params(axis='x', labelrotation=25)
+        axes[3].grid(True, axis='y', alpha=0.3)
+
+        ordered_detector = sorted(
+            detector_events,
+            key=lambda event: float(event.get('stamp', 0.0))
+        )
+        plot_metric(
+            axes[4], ordered_detector, 'callback_total_ms',
+            'Detector callback load'
+        )
+        plot_metric(
+            axes[4], ordered_detector, 'source_to_callback_ms',
+            'Frame age at detector callback'
+        )
+        if len(ordered_detector) > 1:
+            stamps = np.array([
+                float(event.get('stamp', 0.0))
+                for event in ordered_detector
+            ])
+            times = np.array([event['t'] for event in ordered_detector])
+            axes[4].plot(
+                times[1:], np.diff(stamps) * 1000.0,
+                label='Processed-frame spacing', linewidth=1.0
+            )
+
+            sequences = np.array([
+                int(event.get('sequence', 0))
+                for event in ordered_detector
+            ])
+            dropped = np.maximum(np.diff(sequences) - 1, 0)
+            if np.any(dropped > 0):
+                drop_axis = axes[4].twinx()
+                drop_axis.scatter(
+                    times[1:][dropped > 0], dropped[dropped > 0],
+                    color='tab:red', marker='x', s=30,
+                    label='Skipped camera sequences'
+                )
+                drop_axis.set_ylabel('Skipped frames')
+                handles, labels = drop_axis.get_legend_handles_labels()
+                if handles:
+                    drop_axis.legend(handles, labels, loc='upper left', fontsize=8)
+        axes[4].set_title(
+            'Load, input spacing, and queue-drop evidence '
+            '(callback load > frame spacing cannot keep up)'
+        )
+        axes[4].set_ylabel('Time (ms)')
+        axes[4].grid(True, alpha=0.3)
+        axes[4].legend(loc='upper right', fontsize=8, ncol=3)
+
+        for ax in (axes[0], axes[1], axes[2], axes[4]):
+            ax.set_xlabel('Time (s)')
+
+        plt.tight_layout()
+        filepath = os.path.join(
+            self.save_dir, f'aruco_latency_profile_{prefix}.png'
+        )
         self.save_figure(fig, filepath)
 
     def plot_marker_quality(self, prefix):
@@ -1331,9 +1811,14 @@ class EKFPlotter:
             return self.save_and_report_in_process()
 
         if pid > 0:
-            print(f"[PLOTTER] Detached saver started with PID {pid}")
-            print(f"[PLOTTER] Saver log: {log_path}")
-            print("[PLOTTER] roslaunch may exit now; plots will continue saving in the detached process.")
+            self.write_shutdown_status('detached_started', pid=pid)
+            print(f"[PLOTTER] Detached saver started with PID {pid}", flush=True)
+            print(f"[PLOTTER] Saver log: {log_path}", flush=True)
+            print(
+                "[PLOTTER] roslaunch may exit now; plots will continue "
+                "saving in the detached process.",
+                flush=True
+            )
             return None
 
         # Child process.
@@ -1373,6 +1858,11 @@ class EKFPlotter:
             import traceback
             traceback.print_exc()
         finally:
+            self.write_shutdown_status(
+                'complete' if exit_code == 0 else 'failed',
+                pid=os.getpid(),
+                error=None if exit_code == 0 else 'detached saver failed'
+            )
             try:
                 plt.close('all')
             except Exception:
@@ -1391,6 +1881,8 @@ class EKFPlotter:
                 print("[PLOTTER] Skipped due to timeout:", flush=True)
                 for label in result['skipped_timeout']:
                     print(f"  - {label}", flush=True)
+        elif result['failed_plots']:
+            print("[PLOTTER] Plot save completed with failures.", flush=True)
         else:
             print("[PLOTTER] All available plots saved successfully!", flush=True)
 
@@ -1398,9 +1890,17 @@ class EKFPlotter:
         print(f"[PLOTTER] Location: {self.save_dir}", flush=True)
 
     def save_and_report_in_process(self):
-        result = self.save_all_plots('final')
-        self.print_save_result(result)
-        return result
+        self.write_shutdown_status('saving_in_process', pid=os.getpid())
+        try:
+            result = self.save_all_plots('final')
+            self.print_save_result(result)
+            self.write_shutdown_status('complete', pid=os.getpid())
+            return result
+        except Exception as exc:
+            self.write_shutdown_status(
+                'failed', pid=os.getpid(), error=str(exc)
+            )
+            raise
 
     def save_and_exit(self):
         if self.shutdown_complete:
@@ -1422,10 +1922,14 @@ class EKFPlotter:
             len(self.covariance_events) > 0 or
             len(self.kalman_gain_events) > 0 or
             len(self.marker_quality_events) > 0 or
-            len(self.timing_events) > 0
+            len(self.timing_events) > 0 or
+            len(self.camera_timing_events) > 0 or
+            len(self.aruco_detector_timing_events) > 0 or
+            len(self.aruco_ekf_timing_events) > 0
         )
         if not has_any_data:
             print("[PLOTTER] No data collected, nothing to save")
+            self.write_shutdown_status('no_data', pid=os.getpid())
             return
 
         try:
@@ -1434,6 +1938,9 @@ class EKFPlotter:
             else:
                 self.save_and_report_in_process()
         except Exception as e:
+            self.write_shutdown_status(
+                'failed', pid=os.getpid(), error=str(e)
+            )
             print(f"[PLOTTER] Error saving plots: {e}")
             import traceback
             traceback.print_exc()
